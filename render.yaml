@@ -1,0 +1,22 @@
+# Render Blueprint: creates the service with these settings when the repository is connected.
+# Free instances sleep after 15 minutes without traffic and have a temporary disk, which suits an app
+# that deletes everything when the last person leaves. Limits are kept small to fit that disk.
+services:
+  - type: web
+    name: roomshare
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: TRUST_PROXY # One proxy (Render's) sits in front of the server.
+        value: "1"
+      - key: MAX_FILE_BYTES # 100 MB per file
+        value: "104857600"
+      - key: MAX_ROOM_BYTES # 500 MB per room
+        value: "524288000"
+      - key: MAX_TOTAL_BYTES # 1 GB across all rooms
+        value: "1073741824"
