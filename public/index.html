@@ -8,9 +8,31 @@
   <meta name="description" content="Share files and text between your devices in a temporary room. No account needed, and everything is deleted when the last person leaves.">
   <title>RoomShare</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230e7c6b'/%3E%3Cg fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' transform='translate(6 6) scale(.83)'%3E%3Cpolyline points='17 1 21 5 17 9'/%3E%3Cpath d='M3 11V9a4 4 0 0 1 4-4h14'/%3E%3Cpolyline points='7 23 3 19 7 15'/%3E%3Cpath d='M21 13v2a4 4 0 0 1-4 4H3'/%3E%3C/g%3E%3C/svg%3E">
+  <!-- Installable app -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="RoomShare">
+  <!-- Link previews. Lines holding an address are dropped when the server has no public address. -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="RoomShare">
+  <meta property="og:title" content="RoomShare: share files and text between your devices">
+  <meta property="og:description" content="Create a temporary room, open the link on any device, and send files and text instantly. No account needed. Everything is deleted when everyone leaves.">
+  <meta property="og:url" content="__PUBLIC_URL__/">
+  <meta property="og:image" content="__PUBLIC_URL__/og-image.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="RoomShare: share files and text between your devices">
+  <meta name="twitter:description" content="Create a temporary room, open the link on any device, and send files and text instantly. No account needed.">
+  <meta name="twitter:image" content="__PUBLIC_URL__/og-image.png">
+  <!-- Filled in by the server when the bot check is switched on. -->
+  <meta name="turnstile-site-key" content="__TURNSTILE_SITE_KEY__">
   <link rel="stylesheet" href="/style.css?v=__VERSION__">
   <script src="/theme.js?v=__VERSION__"></script>
   <script src="/textsync.js?v=__VERSION__" defer></script>
+  <script src="/vendor/qrcode.js?v=__VERSION__" defer></script>
+  <script src="/qr.js?v=__VERSION__" defer></script>
   <script src="/app.js?v=__VERSION__" defer></script>
 </head>
 <body>
@@ -34,6 +56,8 @@
     <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9z"/></symbol>
     <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
     <symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+    <symbol id="i-download-app" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="3"/><path d="M12 7v7M9 11l3 3 3-3M10 18h4"/></symbol>
   </svg>
 
   <main id="home" class="home">
@@ -47,18 +71,38 @@
       <h1>RoomShare</h1>
       <p class="lead">Send files and text between your phone, tablet and computer. No account, no install.</p>
 
+      <div id="turnstile" class="turnstile" hidden></div>
+
       <button id="create-room" class="btn primary lg wide" type="button">
         <span>Create a room</span>
         <svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg>
       </button>
 
+      <button id="password-toggle" class="link-btn" type="button" aria-expanded="false" aria-controls="create-password-row">
+        <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>
+        <span>Protect with a password (optional)</span>
+      </button>
+      <div id="create-password-row" class="password-row" hidden>
+        <label class="visually-hidden" for="create-password">Room password</label>
+        <input id="create-password" class="field" type="password" maxlength="128" placeholder="Choose a password"
+               autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false">
+        <p class="field-hint">People will need this password, as well as the link, to join.</p>
+      </div>
+
       <p class="divider"><span>or join with a room ID</span></p>
 
       <form id="join-form" class="join-form" novalidate>
-        <label class="visually-hidden" for="room-input">Room ID</label>
-        <input id="room-input" class="field code-field" type="text" inputmode="text" placeholder="Room ID or link"
-               autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go" required>
-        <button class="btn lg" type="submit">Join</button>
+        <div class="join-row">
+          <label class="visually-hidden" for="room-input">Room ID</label>
+          <input id="room-input" class="field code-field" type="text" inputmode="text" placeholder="Room ID or link"
+                 autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go" required>
+          <button class="btn lg" type="submit">Join</button>
+        </div>
+        <div id="join-password-row" class="password-row" hidden>
+          <label class="visually-hidden" for="join-password">Room password</label>
+          <input id="join-password" class="field" type="password" maxlength="128" placeholder="This room needs a password"
+                 autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go">
+        </div>
       </form>
 
       <p id="home-error" class="form-error" role="alert" hidden></p>
@@ -68,6 +112,11 @@
         <li><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg><span>Only people with the room ID can get in.</span></li>
         <li><svg class="icon" aria-hidden="true"><use href="#i-timer"/></svg><span>Deleted for good when the last person leaves.</span></li>
       </ul>
+
+      <button id="install-app" class="link-btn install" type="button" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-download-app"/></svg>
+        <span>Install the app on this device</span>
+      </button>
     </div>
   </main>
 
@@ -82,6 +131,10 @@
         <button id="copy-id" class="chip" type="button" title="Copy room ID" aria-label="Copy room ID">
           <span class="chip-label">Room</span>
           <strong id="room-code"></strong>
+          <span id="lock-badge" class="lock-badge" title="Password protected" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>
+            <span class="visually-hidden">Password protected</span>
+          </span>
           <svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg>
         </button>
         <p id="presence" class="presence" aria-live="polite">
@@ -91,7 +144,7 @@
       </div>
 
       <div class="topbar-actions">
-        <button id="share-room" class="btn primary sm" type="button" title="Copy an invite link">
+        <button id="share-room" class="btn primary sm" type="button" title="Invite people with a link or QR code">
           <svg class="icon" aria-hidden="true"><use href="#i-share"/></svg>
           <span>Share</span>
         </button>
@@ -142,7 +195,7 @@
         <label id="dropzone" class="dropzone" for="file-input">
           <input id="file-input" type="file" multiple>
           <span class="dropzone-icon" aria-hidden="true"><svg class="icon"><use href="#i-upload"/></svg></span>
-          <span class="dropzone-title">Drop files here, or <span class="link">browse</span></span>
+          <span class="dropzone-title">Drop or paste files here, or <span class="link">browse</span></span>
           <span id="size-hint" class="dropzone-hint">Any file type</span>
         </label>
 
@@ -200,6 +253,24 @@
       <div class="modal-actions">
         <button id="confirm-cancel" class="btn" type="button">Cancel</button>
         <button id="confirm-ok" class="btn danger-solid" type="button"></button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="invite" class="modal" aria-labelledby="invite-title">
+    <div class="modal-card invite-card">
+      <h2 id="invite-title">Invite to this room</h2>
+      <p class="invite-hint">Scan with a phone camera, or send the link.</p>
+      <div id="qr" class="qr" role="img" aria-label="QR code for the invite link"></div>
+      <p id="invite-lock" class="invite-lock" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>
+        <span>This room has a password. People need it as well.</span>
+      </p>
+      <input id="invite-link" class="field invite-link" type="text" readonly aria-label="Invite link">
+      <div class="modal-actions invite-actions">
+        <button id="invite-native" class="btn" type="button" hidden>Share…</button>
+        <button id="invite-copy" class="btn primary" type="button">Copy link</button>
+        <button id="invite-close" class="btn" type="button">Done</button>
       </div>
     </div>
   </dialog>

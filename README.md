@@ -10,6 +10,12 @@ Open the site, create a room, and open the link on your phone, tablet or another
 - **Files.** Drag and drop or pick files (up to 2 GB each by default). Everyone in the room can download them. Each file can be deleted on its own, or all at once.
 - **A shared Message box.** One text box that everyone in the room edits together, live, with no Send button. Copy all, Paste and Clear all are one tap away. People typing at the same time keep each other's words.
 - **Nothing is kept.** Text lives in server memory and files in a temporary folder. Once the last person has been gone for 15 seconds the room, its text and its files are deleted.
+- **Invite with a QR code.** Share opens a dialog with a QR code and the link. Point a phone camera at it to join, or copy the link.
+- **Optional room password.** Choose "Protect with a password" when creating a room. Anyone opening the link is asked for it, a lock icon shows inside the room, and repeated wrong guesses are blocked.
+- **Paste images.** Press Ctrl+V with a screenshot or photo copied (or use the Paste button) and it uploads to Files, named by date and time.
+- **Installable.** Add it to the home screen of a phone or the desktop and it opens like an app, with its own icon.
+- **Link previews.** A room link shared in WhatsApp, Slack or similar shows the RoomShare name and a picture. The preview never reveals anything about the room.
+- **Optional bot check.** Free Cloudflare Turnstile can be switched on to stop automated room creation. It is off unless you set its keys.
 - **Light and dark themes.** It follows the device setting and can be switched with one button. The choice is remembered.
 - **Works on every screen.** Phones and tablets show Files and Message as tabs. Larger screens show them side by side. Buttons are sized for touch, and notches and rounded corners are respected.
 - **Fast.** Plain Node.js and one WebSocket per tab. The whole page is about 18 KB (about 6 KB gzipped), cached by the browser after the first visit, with no build step and no front-end library.
@@ -26,7 +32,7 @@ npm start        # http://localhost:3000
 To try it from a phone on the same Wi-Fi, open `http://<your-computer's-address>:3000`. Allow Node.js through the firewall if asked. Over plain `http://` on a network address the browser may block the Paste button, so use Ctrl+V or a long press instead. It works normally over HTTPS.
 
 ```bash
-npm test         # 33 tests, about 4 seconds
+npm test         # 57 tests, a few seconds
 ```
 
 ## How it works
@@ -51,14 +57,21 @@ roomShare/
 ├── package.json
 ├── render.yaml           One-click setup for Render (free plan)
 ├── public/               Everything the browser loads
-│   ├── index.html        Home screen and room markup, icons, dialog
+│   ├── index.html        Home screen and room markup, icons, dialogs, link-preview tags
 │   ├── style.css         Light and dark themes, responsive layout
-│   ├── app.js            Page logic: rooms, files, shared text, buttons
+│   ├── app.js            Page logic: rooms, files, shared text, passwords, invite, buttons
 │   ├── textsync.js       Merges simultaneous typing (runs in browser and server)
-│   └── theme.js          Light/dark switch, applied before the page paints
+│   ├── theme.js          Light/dark switch, applied before the page paints
+│   ├── qr.js             Turns a link into QR code image data
+│   ├── vendor/qrcode.js  QR encoder by Kazuhiko Arase (MIT), copied from npm
+│   ├── manifest.webmanifest, icon-*.png, apple-touch-icon.png   Installable-app files
+│   └── og-image.png      Picture shown in link previews
 └── test/
-    ├── rooms.test.js     Server tests: access, files, text, online count, cleanup
-    └── textsync.test.js  Merge engine tests and random-typing simulation
+    ├── rooms.test.js       Server tests: access, files, text, online count, cleanup
+    ├── protection.test.js  Passwords, lockout, bot check, room cap, security policy
+    ├── assets.test.js      Manifest, icons, link-preview tags, robots header
+    ├── qr.test.js          Draws QR codes and decodes them back with a separate reader
+    └── textsync.test.js    Merge engine tests and random-typing simulation
 ```
 
 ## Configuration
@@ -74,6 +87,10 @@ Everything is optional. Set these as environment variables.
 | `MAX_ROOM_BYTES` / `MAX_TOTAL_BYTES` | 10 GiB / 50 GiB | Per-room and whole-server disk caps |
 | `MAX_ROOM_FILES`, `MAX_ROOM_USERS` | 500, 500 | Per-room caps |
 | `MAX_TEXT_CHARS` | 100000 | Length of the shared text |
+| `MAX_ROOMS` | 500 | Rooms that may exist at once. New rooms are refused beyond this, which protects a small server from a flood |
+| `PASSWORD_FAILURES_PER_MINUTE` | 20 | Wrong room passwords allowed per room per minute from everyone together. Past this the room refuses all password attempts for a minute |
+| `PUBLIC_URL` | (none) | The site's public address, for link previews. On Render it is filled in automatically from `RENDER_EXTERNAL_URL` |
+| `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET` | (none) | Switch on the Cloudflare Turnstile bot check. Both are needed |
 | `ROOM_ATTEMPTS_PER_MINUTE` | 30 | Per address. Counts room creation and failed joins |
 | `TRUST_PROXY` | `0` | How many reverse proxies are in front of the server (`1` on Render or behind nginx, `2` for a CDN plus the host's proxy). The client address is then read from the entry those proxies added to `X-Forwarded-For`, not from what a visitor sends |
 
@@ -102,6 +119,24 @@ What to expect on the free plan:
 - The limits in `render.yaml` (100 MB per file, 500 MB per room, 1 GB in total) suit a small free disk. Raise them on a larger plan.
 - Everyone in a room connects to this one server, so people far from its region see each other's changes a round trip later, roughly 100 to 300 ms between continents. Pick the region closest to most of your users.
 
+### Turning on the bot check (optional)
+
+Without it, anyone can create rooms, limited only by the per-address rate limit and `MAX_ROOMS`. To require a free Cloudflare Turnstile check:
+
+1. In the Cloudflare dashboard open **Turnstile**, choose **Add site**, enter your site's hostname (for example `roomshare.onrender.com`), and pick the **Managed** widget.
+2. Copy the **site key** and the **secret key** it gives you.
+3. Add them in Render under Environment as `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET`, and save.
+
+When it is on, the page loads Cloudflare's script and a small widget appears above the Create button. Each new room needs a fresh pass, and joining an existing room does not. If Cloudflare cannot be reached, new rooms are refused rather than let through. The secret is only ever read by the server.
+
+To try it locally without an account, use Cloudflare's published test keys: site key `1x00000000000000000000AA` and secret `1x0000000000000000000000000000000AA` always pass, and the secret `2x0000000000000000000000000000000AA` always fails.
+
+### Link previews and installing
+
+- Previews are built from the site's public address. Render provides it automatically, and elsewhere you set `PUBLIC_URL`. Chat apps cache a preview for a while, so changes to it can take time to show up.
+- Room links ask search engines not to index them.
+- "Install" and "Add to Home Screen" need HTTPS, which Render provides. Chrome and Edge show an install button on the home screen. On iPhones the button explains Share > Add to Home Screen.
+
 ### Other hosts
 
 Anything that runs `npm start` behind HTTPS will do, as long as it is a single instance. An Oracle Cloud Always Free VM stays on all the time, but you run the server yourself.
@@ -115,11 +150,11 @@ Anything that runs `npm start` behind HTTPS will do, as long as it is a single i
 ## Security and limits
 
 - **Not end-to-end encrypted.** The server relays the text and holds files unencrypted on its disk while a room is open. Use HTTPS, and do not use it for sensitive material unless you add client-side encryption.
-- **Anyone with the room ID can join.** There is no password or approval step. IDs have about 40 bits of randomness, and creating rooms or failing to join is rate limited per address.
+- **Anyone with the room ID can join, unless the room has a password.** IDs have about 40 bits of randomness, and creating rooms or failing to join is rate limited per address. A room password is checked on the server and kept only as a salted hash. It controls who can enter, and it does not encrypt anything: the server still sees the text and files. The invite link and QR code do not contain the password, so share it separately.
 - **Files are always served as downloads,** never displayed by the browser, and the page's content security policy blocks anything but its own scripts and styles.
 - **A public anonymous file host can attract misuse.** Files are not scanned. Keep the size limits modest if you open it to everyone.
 - **Rooms are temporary on purpose.** A server restart ends every room, and the shared text is limited to 100,000 characters.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The bundled QR encoder in `public/vendor/qrcode.js` is [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) by Kazuhiko Arase, also MIT. "QR Code" is a registered trademark of Denso Wave Incorporated.

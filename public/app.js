@@ -17,6 +17,7 @@ let maxFileBytes = Infinity;
 let online = 0;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
+let locked = false; // Whether the room has a password.
 let session = new TextSync.Session();
 let composing = false; // True while an input method (Hindi, Telugu, Chinese...) is building a character.
 let held = []; // Changes from others that arrived mid-composition. Applying them would break the character.
@@ -56,13 +57,14 @@ function icon(name) {
 
 /* ---------- Feedback: toasts and confirmation ---------- */
 
-function toast(text, { error = false } = {}) {
+function toast(text, { error = false, long = false } = {}) {
   const container = $('toasts');
   const node = element('div', error ? 'toast error' : 'toast', text);
   container.append(node);
   while (container.children.length > 3) container.firstChild.remove();
-  setTimeout(() => node.classList.add('leaving'), 2600);
-  setTimeout(() => node.remove(), 2850);
+  const visibleFor = long ? 6000 : 2600;
+  setTimeout(() => node.classList.add('leaving'), visibleFor);
+  setTimeout(() => node.remove(), visibleFor + 250);
 }
 
 function confirmDialog({ title, body, action }) {
@@ -99,12 +101,22 @@ function syncStates() {
   $('char-count').textContent = `${box.value.length.toLocaleString()}${max}`;
 }
 
+function setCreatePasswordOpen(open) {
+  $('create-password-row').hidden = !open;
+  $('password-toggle').setAttribute('aria-expanded', open);
+  if (!open) $('create-password').value = '';
+}
+
 function showHome(error) {
   roomId = null;
   // Nothing from the room just left may show up in the next one.
   session = new TextSync.Session();
   held = [];
   online = 0;
+  locked = false;
+  $('lock-badge').hidden = true;
+  $('join-password-row').hidden = true;
+  $('join-password').value = '';
   box.value = '';
   filesList.replaceChildren();
   uploads.replaceChildren();
@@ -149,18 +161,33 @@ tabs.forEach((tab, index) => {
 
 /* ---------- Connection ---------- */
 
-async function requestRoom(url) {
-  const response = await fetch(url, { method: 'POST' });
+async function requestRoom(url, payload) {
+  const options = { method: 'POST' };
+  if (payload) Object.assign(options, { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  const response = await fetch(url, options);
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw Object.assign(new Error(body.error ?? 'Something went wrong.'), { status: response.status });
+  if (!response.ok) {
+    throw Object.assign(new Error(body.error ?? 'Something went wrong.'), {
+      status: response.status,
+      needsPassword: body.needsPassword === true,
+    });
+  }
   return body;
 }
 
-async function enterRoom(url) {
-  const { id } = await requestRoom(url);
+async function enterRoom(url, payload) {
+  const { id } = await requestRoom(url, payload);
   roomId = id;
   showRoom(id);
   connect();
+}
+
+// Back to the home screen with the password box open for a protected room.
+function requirePassword(id, message) {
+  showHome(message);
+  if (id) $('room-input').value = id;
+  $('join-password-row').hidden = false;
+  $('join-password').focus();
 }
 
 // Handlers are detached first, so a socket that is being replaced cannot deliver messages or trigger a reconnect.
@@ -200,6 +227,7 @@ async function rejoin() {
   } catch (error) {
     // Only a clear answer from the server ends the room. Anything else is a network problem.
     if (error.status === 404) showHome('This room has ended.');
+    else if (error.needsPassword) requirePassword(id, error.message);
     else scheduleReconnect();
   }
 }
@@ -268,6 +296,8 @@ function handleMessage(data) {
       reconnectAttempts = 0;
       maxFileBytes = data.maxFileBytes;
       box.maxLength = data.maxTextChars;
+      locked = data.locked;
+      $('lock-badge').hidden = !locked;
       $('size-hint').textContent = `Any file type, up to ${formatSize(data.maxFileBytes)} each`;
       filesList.replaceChildren();
       data.files.forEach(addFile);
@@ -472,14 +502,65 @@ function parseRoomInput(value) {
   return value.trim().toLowerCase().match(/(?:^|\/)([a-z0-9]{8})\/?$/)?.[1];
 }
 
+/* ---------- Bot check (only when the server has it switched on) ---------- */
+
+const challengeKey = document.querySelector('meta[name="turnstile-site-key"]')?.content ?? '';
+const challenge = { widget: null, token: '' };
+
+function loadChallenge() {
+  if (!challengeKey) return;
+  $('turnstile').hidden = false;
+  const script = document.createElement('script');
+  script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+  script.async = true;
+  script.onload = () => {
+    challenge.widget = window.turnstile.render('#turnstile', {
+      sitekey: challengeKey,
+      callback: (token) => {
+        challenge.token = token;
+      },
+      'expired-callback': () => {
+        challenge.token = '';
+      },
+      'error-callback': () => {
+        challenge.token = '';
+      },
+    });
+  };
+  script.onerror = () => {
+    $('turnstile').textContent = 'The human check could not load. Reload the page to try again.';
+  };
+  document.head.append(script);
+}
+
+// Each token works once, so the check starts over after every attempt.
+function renewChallenge() {
+  challenge.token = '';
+  if (challenge.widget !== null) window.turnstile.reset(challenge.widget);
+}
+
+/* ---------- Creating and joining ---------- */
+
+$('password-toggle').addEventListener('click', () => {
+  const open = $('create-password-row').hidden;
+  setCreatePasswordOpen(open);
+  if (open) $('create-password').focus();
+});
+
 $('create-room').addEventListener('click', async (event) => {
   const button = event.currentTarget;
+  if (challengeKey && !challenge.token) {
+    showHome('Please wait for the human check to finish, then try again.');
+    return;
+  }
   button.disabled = true;
   try {
-    await enterRoom('/api/rooms');
+    await enterRoom('/api/rooms', { password: $('create-password').value, turnstileToken: challenge.token });
+    setCreatePasswordOpen(false);
   } catch (error) {
     showHome(error.status ? error.message : 'Could not reach the server. Check your connection.');
   }
+  if (challengeKey) renewChallenge();
   button.disabled = false;
 });
 
@@ -487,10 +568,12 @@ $('join-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const id = parseRoomInput($('room-input').value);
   if (!id) return showHome('Enter the 8-character room ID, or paste the room link.');
+  const password = $('join-password').value;
   try {
-    await enterRoom(`/api/rooms/${id}/join`);
+    await enterRoom(`/api/rooms/${id}/join`, password ? { password } : undefined);
   } catch (error) {
-    showHome(error.status ? error.message : 'Could not reach the server. Check your connection.');
+    if (error.needsPassword) requirePassword(id, error.message);
+    else showHome(error.status ? error.message : 'Could not reach the server. Check your connection.');
   }
 });
 
@@ -511,18 +594,55 @@ $('leave-room').addEventListener('click', async () => {
 
 $('copy-id').addEventListener('click', () => copyWithToast(roomId, 'Room ID copied'));
 
-$('share-room').addEventListener('click', async () => {
-  const url = `${location.origin}/r/${roomId}`;
-  // Phones and tablets have a share sheet that goes straight to their messaging apps.
-  if (navigator.share && window.matchMedia('(pointer: coarse)').matches) {
-    try {
-      await navigator.share({ title: 'Join my RoomShare room', url });
-      return;
-    } catch (error) {
-      if (error.name === 'AbortError') return;
-    }
+/* ---------- Invite dialog ---------- */
+
+const inviteUrl = () => `${location.origin}/r/${roomId}`;
+// Phones and tablets have a share sheet that goes straight to their messaging apps.
+const canShareNatively = () => Boolean(navigator.share) && window.matchMedia('(pointer: coarse)').matches;
+
+function drawQr(url) {
+  const svgNs = 'http://www.w3.org/2000/svg';
+  try {
+    const { size, path } = Qr.build(url);
+    const svg = document.createElementNS(svgNs, 'svg');
+    const bars = document.createElementNS(svgNs, 'path');
+    svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+    svg.setAttribute('shape-rendering', 'crispEdges');
+    svg.setAttribute('aria-hidden', 'true');
+    bars.setAttribute('d', path);
+    bars.setAttribute('fill', '#000');
+    svg.append(bars);
+    $('qr').replaceChildren(svg);
+    $('qr').hidden = false;
+  } catch {
+    $('qr').hidden = true; // The link below still works without the picture.
   }
-  copyWithToast(url, 'Invite link copied');
+}
+
+$('share-room').addEventListener('click', () => {
+  const url = inviteUrl();
+  const dialog = $('invite');
+  if (typeof dialog.showModal !== 'function') return copyWithToast(url, 'Invite link copied');
+  $('invite-link').value = url;
+  $('invite-lock').hidden = !locked;
+  $('invite-native').hidden = !canShareNatively();
+  drawQr(url);
+  dialog.showModal();
+  $('invite-copy').focus();
+});
+
+$('invite-copy').addEventListener('click', () => copyWithToast(inviteUrl(), 'Invite link copied'));
+$('invite-close').addEventListener('click', () => $('invite').close());
+$('invite').addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) event.currentTarget.close(); // A click on the dimmed area.
+});
+$('invite-link').addEventListener('focus', (event) => event.target.select());
+$('invite-native').addEventListener('click', async () => {
+  try {
+    await navigator.share({ title: 'Join my RoomShare room', url: inviteUrl() });
+  } catch (error) {
+    if (error.name !== 'AbortError') copyWithToast(inviteUrl(), 'Invite link copied');
+  }
 });
 
 $('copy-text').addEventListener('click', () => copyWithToast(box.value, 'Message copied'));
@@ -539,16 +659,48 @@ $('clear-text').addEventListener('click', async () => {
   typed();
 });
 
+// Pasted screenshots arrive named "image.png", which is no help in a list of files.
+function nameClipboardFile(file) {
+  if (!/^image\.\w+$/i.test(file.name)) return file;
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  return new File([file], `screenshot-${stamp}.${file.name.split('.').pop().toLowerCase()}`, { type: file.type });
+}
+
+function uploadPasted(files) {
+  selectTab('files');
+  uploadAll(files.map(nameClipboardFile));
+}
+
+// Pasting an image with the keyboard or a long press uploads it. Pasting text is left alone.
+document.addEventListener('paste', (event) => {
+  const files = [...(event.clipboardData?.files ?? [])];
+  if (!roomId || roomView.hidden || files.length === 0) return;
+  event.preventDefault();
+  uploadPasted(files);
+});
+
 $('paste-text').addEventListener('click', async () => {
   box.focus();
-  let text;
+  let text = '';
+  const images = [];
   try {
-    text = await navigator.clipboard.readText();
+    for (const item of await navigator.clipboard.read()) {
+      const imageType = item.types.find((type) => type.startsWith('image/'));
+      if (imageType) images.push(new File([await item.getType(imageType)], `image.${imageType.split('/')[1]}`, { type: imageType }));
+      else if (item.types.includes('text/plain')) text += await (await item.getType('text/plain')).text();
+    }
   } catch {
-    // Browsers only allow this from a secure page and with permission. Pasting by hand always works.
-    toast('Clipboard access is blocked here. Paste with Ctrl+V or a long press instead.', { error: true });
-    return;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      // Browsers only allow this from a secure page and with permission. Pasting by hand always works.
+      toast('Clipboard access is blocked here. Paste with Ctrl+V or a long press instead.', { error: true });
+      return;
+    }
   }
+  if (images.length) uploadPasted(images);
   if (!text) return;
   box.setRangeText(text, box.selectionStart, box.selectionEnd, 'end');
   if (box.maxLength > 0 && box.value.length > box.maxLength) {
@@ -603,6 +755,33 @@ document.addEventListener('visibilitychange', () => {
 });
 
 window.addEventListener('popstate', () => location.reload());
+
+/* ---------- Installing the app ---------- */
+
+let installPrompt = null;
+const onIphone = /iphone|ipad|ipod/i.test(navigator.userAgent) && !navigator.standalone;
+
+// Chrome and Edge offer an install prompt. iPhones have none, so they get instructions instead.
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  installPrompt = event;
+  $('install-app').hidden = false;
+});
+window.addEventListener('appinstalled', () => {
+  installPrompt = null;
+  $('install-app').hidden = true;
+});
+if (onIphone) $('install-app').hidden = false;
+
+$('install-app').addEventListener('click', async () => {
+  if (!installPrompt) return toast('Tap the Share button, then "Add to Home Screen".', { long: true });
+  installPrompt.prompt();
+  await installPrompt.userChoice;
+  installPrompt = null;
+  $('install-app').hidden = true;
+});
+
+loadChallenge();
 
 const linkedRoom = location.pathname.match(/^\/r\/([a-z0-9]{8})$/)?.[1];
 if (linkedRoom) {

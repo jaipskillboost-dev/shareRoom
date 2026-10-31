@@ -14,5 +14,9 @@
   },
   "dependencies": {
     "ws": "^8.22.1"
+  },
+  "devDependencies": {
+    "jsqr": "^1.4.0",
+    "qrcode-generator": "^2.0.4"
   }
 }

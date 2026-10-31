@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const zlib = require('node:zlib');
 const { pipeline } = require('node:stream/promises');
+const { promisify } = require('node:util');
 const { WebSocket, WebSocketServer } = require('ws');
 const { Doc } = require('./public/textsync.js');
 
@@ -32,7 +33,23 @@ const config = {
   roomAttemptsPerMinute: envNumber('ROOM_ATTEMPTS_PER_MINUTE', 30),
   // Changes to the shared text one person may send per heartbeat. Only one is in flight at a time, so typing stays far below it.
   editsPerHeartbeat: 400,
+  // Rooms that may exist at once. A free server's memory and disk are small, and this stops a flood from filling them.
+  maxRooms: envNumber('MAX_ROOMS', 500),
+  // Wrong passwords allowed per room per minute from everyone together, so many addresses cannot guess one in parallel.
+  passwordFailuresPerMinute: envNumber('PASSWORD_FAILURES_PER_MINUTE', 20),
+  // The site's public address, used in link previews. Render sets RENDER_EXTERNAL_URL by itself.
+  publicUrl: /^https?:\/\//.test(process.env.PUBLIC_URL ?? process.env.RENDER_EXTERNAL_URL ?? '')
+    ? (process.env.PUBLIC_URL ?? process.env.RENDER_EXTERNAL_URL).replace(/\/+$/, '')
+    : '',
+  // Cloudflare Turnstile is a free bot check shown before a room is created. It is off unless both keys are set.
+  turnstile: {
+    siteKey: process.env.TURNSTILE_SITE_KEY ?? '',
+    secret: process.env.TURNSTILE_SECRET ?? '',
+    verifyUrl: process.env.TURNSTILE_VERIFY_URL ?? 'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+  },
 };
+const turnstileOn = Boolean(config.turnstile.siteKey && config.turnstile.secret);
+const scrypt = promisify(crypto.scrypt);
 
 // Only this subfolder is ever wiped, so STORAGE_DIR can safely point at a shared disk.
 const storageRoot = path.join(process.env.STORAGE_DIR ?? os.tmpdir(), 'roomshare-files');
@@ -56,9 +73,11 @@ function newRoomId() {
   return id;
 }
 
-async function openRoom() {
+async function openRoom(password = null) {
   const room = {
     id: newRoomId(),
+    password, // { salt, key } when the creator set one. Never the password itself.
+    badPasswords: { count: 0, resetAt: 0 },
     members: new Map(), // member token -> display name
     sockets: new Set(),
     document: new Doc(config.maxTextChars),
@@ -159,13 +178,83 @@ function admit(req, res, room, status) {
   sendJson(res, status, { id: room.id });
 }
 
-async function createRoom(req, res) {
-  if (overAttemptLimit(req)) return sendJson(res, 429, { error: 'Too many attempts. Wait a minute and try again.' });
-  countAttempt(req);
-  admit(req, res, await openRoom(), 201);
+// Reads a small JSON body. A body that is too large is rejected after it is read, so the reply can still be sent.
+function readJson(req, limit = 2048) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size <= limit) chunks.push(chunk);
+      else if (size > 64 * 1024) req.destroy(); // Not worth draining.
+    });
+    req.on('error', reject);
+    req.on('end', () => {
+      if (size > limit) return reject(Object.assign(new Error('That request is too large.'), { status: 413 }));
+      if (size === 0) return resolve({});
+      try {
+        const body = JSON.parse(Buffer.concat(chunks));
+        resolve(body && typeof body === 'object' ? body : {});
+      } catch {
+        reject(Object.assign(new Error('That request could not be read.'), { status: 400 }));
+      }
+    });
+  });
 }
 
-function joinRoom(req, res, roomId) {
+const MAX_PASSWORD_CHARS = 128;
+
+async function hashPassword(text) {
+  const salt = crypto.randomBytes(16);
+  return { salt, key: await scrypt(text, salt, 32) };
+}
+
+async function passwordMatches(room, text) {
+  return crypto.timingSafeEqual(await scrypt(text, room.password.salt, 32), room.password.key);
+}
+
+// The bot check runs once per new room. If it cannot be completed, the room is refused rather than let through.
+async function passesBotCheck(req, token) {
+  if (typeof token !== 'string' || !token || token.length > 2048) return false;
+  try {
+    const form = new URLSearchParams({ secret: config.turnstile.secret, response: token, remoteip: clientIp(req) ?? '' });
+    const response = await fetch(config.turnstile.verifyUrl, { method: 'POST', body: form, signal: AbortSignal.timeout(5000) });
+    return (await response.json()).success === true;
+  } catch {
+    return false;
+  }
+}
+
+async function createRoom(req, res) {
+  if (overAttemptLimit(req)) return sendJson(res, 429, { error: 'Too many attempts. Wait a minute and try again.' });
+  let body;
+  try {
+    body = await readJson(req);
+  } catch (error) {
+    return sendJson(res, error.status ?? 400, { error: error.message });
+  }
+  countAttempt(req);
+
+  if (turnstileOn && !(await passesBotCheck(req, body.turnstileToken))) {
+    return sendJson(res, 403, { error: "We couldn't confirm you are human. Reload the page and try again." });
+  }
+  if (rooms.size >= config.maxRooms) {
+    return sendJson(res, 503, { error: 'RoomShare is busy right now. Try again in a few minutes.' });
+  }
+  const password = body.password ?? '';
+  if (typeof password !== 'string' || password.length > MAX_PASSWORD_CHARS) {
+    return sendJson(res, 400, { error: `The password can be at most ${MAX_PASSWORD_CHARS} characters.` });
+  }
+  admit(req, res, await openRoom(password ? await hashPassword(password) : null), 201);
+}
+
+function tooManyBadPasswords(room) {
+  const now = Date.now();
+  if (now > room.badPasswords.resetAt) room.badPasswords = { count: 0, resetAt: now + 60_000 };
+  return room.badPasswords.count >= config.passwordFailuresPerMinute;
+}
+
+async function joinRoom(req, res, roomId) {
   if (overAttemptLimit(req)) return sendJson(res, 429, { error: 'Too many attempts. Wait a minute and try again.' });
   const room = rooms.get(roomId);
   if (!room) {
@@ -173,6 +262,29 @@ function joinRoom(req, res, roomId) {
     return sendJson(res, 404, { error: 'Room not found. It may have ended.' });
   }
   if (room.sockets.size >= config.maxRoomUsers) return sendJson(res, 403, { error: 'This room is full.' });
+
+  // People already inside (a reconnect after a dropped signal) do not need the password again.
+  if (room.password && !room.members.has(memberToken(req))) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (error) {
+      return sendJson(res, error.status ?? 400, { error: error.message });
+    }
+    const given = body.password;
+    if (typeof given !== 'string' || given === '') {
+      return sendJson(res, 401, { error: 'This room is protected. Enter its password.', needsPassword: true });
+    }
+    if (tooManyBadPasswords(room)) {
+      return sendJson(res, 429, { error: 'Too many wrong passwords for this room. Try again in a minute.', needsPassword: true });
+    }
+    if (given.length > MAX_PASSWORD_CHARS || !(await passwordMatches(room, given))) {
+      room.badPasswords.count += 1;
+      countAttempt(req);
+      return sendJson(res, 401, { error: 'Wrong password.', needsPassword: true });
+    }
+    if (room.destroyed) return sendJson(res, 404, { error: 'Room not found. It may have ended.' });
+  }
   admit(req, res, room, 200);
 }
 
@@ -263,39 +375,80 @@ async function deleteFiles(req, res, room, fileId) {
 
 /* ---------- Static files, held compressed in RAM ---------- */
 
-function buildAsset(type, body, cacheControl) {
+// Images are already compressed, so they are kept as they are.
+function buildAsset(type, body, cacheControl, { compress = true } = {}) {
   const raw = Buffer.from(body);
   return {
     type,
     cacheControl,
     etag: `"${crypto.createHash('sha1').update(raw).digest('base64url')}"`,
     raw,
-    br: zlib.brotliCompressSync(raw),
-    gzip: zlib.gzipSync(raw),
+    compressed: compress,
+    br: compress ? zlib.brotliCompressSync(raw) : null,
+    gzip: compress ? zlib.gzipSync(raw) : null,
   };
+}
+
+const escapeAttribute = (text) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+// Fills in the page's link-preview tags and bot-check key. Without a public address the tags that need one are dropped.
+function renderPage(html, version) {
+  return html
+    .split('\n')
+    .filter((line) => config.publicUrl || !line.includes('__PUBLIC_URL__'))
+    .join('\n')
+    .replaceAll('__VERSION__', version)
+    .replaceAll('__PUBLIC_URL__', escapeAttribute(config.publicUrl))
+    .replaceAll('__TURNSTILE_SITE_KEY__', escapeAttribute(turnstileOn ? config.turnstile.siteKey : ''));
 }
 
 function loadAssets() {
-  const read = (file) => fs.readFileSync(path.join(__dirname, 'public', file), 'utf8');
-  const script = read('app.js');
-  const sync = read('textsync.js');
-  const theme = read('theme.js');
-  const styles = read('style.css');
+  const text = (file) => fs.readFileSync(path.join(__dirname, 'public', file), 'utf8');
+  const bytes = (file) => fs.readFileSync(path.join(__dirname, 'public', file));
+  const script = text('app.js');
+  const scripts = { '/textsync.js': text('textsync.js'), '/theme.js': text('theme.js'), '/qr.js': text('qr.js') };
+  const qrLibrary = text('vendor/qrcode.js');
+  const styles = text('style.css');
   // Versioned URLs let browsers cache these forever, so repeat visits need no request for them.
   const hash = crypto.createHash('sha1');
-  for (const source of [script, sync, theme, styles]) hash.update(source);
+  for (const source of [script, ...Object.values(scripts), qrLibrary, styles]) hash.update(source);
   const version = hash.digest('hex').slice(0, 12);
+
   const forever = 'public, max-age=31536000, immutable';
-  return {
-    page: buildAsset('text/html; charset=utf-8', read('index.html').replaceAll('__VERSION__', version), 'no-cache'),
-    '/app.js': buildAsset('text/javascript; charset=utf-8', script, forever),
-    '/textsync.js': buildAsset('text/javascript; charset=utf-8', sync, forever),
-    '/theme.js': buildAsset('text/javascript; charset=utf-8', theme, forever),
+  const daily = 'public, max-age=86400'; // Not versioned, so a change can take up to a day to reach browsers.
+  const js = 'text/javascript; charset=utf-8';
+  const found = {
+    page: buildAsset('text/html; charset=utf-8', renderPage(text('index.html'), version), 'no-cache'),
+    '/app.js': buildAsset(js, script, forever),
+    '/vendor/qrcode.js': buildAsset(js, qrLibrary, forever),
     '/style.css': buildAsset('text/css; charset=utf-8', styles, forever),
+    '/manifest.webmanifest': buildAsset('application/manifest+json', text('manifest.webmanifest'), daily),
   };
+  for (const [url, source] of Object.entries(scripts)) found[url] = buildAsset(js, source, forever);
+  for (const image of ['icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png', 'og-image.png']) {
+    found[`/${image}`] = buildAsset('image/png', bytes(image), daily, { compress: false });
+  }
+  return found;
 }
 
 const assets = loadAssets();
+
+// Only the bot check's own address is added, and only when the check is on.
+const challenge = turnstileOn ? ' https://challenges.cloudflare.com' : '';
+const contentSecurityPolicy = [
+  "default-src 'none'",
+  `script-src 'self'${challenge}`,
+  "style-src 'self'",
+  `connect-src 'self'${challenge}`,
+  turnstileOn ? `frame-src${challenge}` : null,
+  "img-src 'self' data:",
+  "manifest-src 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+]
+  .filter(Boolean)
+  .join('; ');
 
 function serveAsset(req, res, asset) {
   res.setHeader('Vary', 'Accept-Encoding');
@@ -304,7 +457,7 @@ function serveAsset(req, res, asset) {
   if (req.headers['if-none-match'] === asset.etag) return res.writeHead(304).end();
 
   const accepted = req.headers['accept-encoding'] ?? '';
-  const encoding = /\bbr\b/.test(accepted) ? 'br' : /\bgzip\b/.test(accepted) ? 'gzip' : null;
+  const encoding = !asset.compressed ? null : /\bbr\b/.test(accepted) ? 'br' : /\bgzip\b/.test(accepted) ? 'gzip' : null;
   const body = encoding ? asset[encoding] : asset.raw;
   if (encoding) res.setHeader('Content-Encoding', encoding);
   res.writeHead(200, { 'Content-Type': asset.type, 'Content-Length': body.length });
@@ -323,10 +476,7 @@ const server = http.createServer((req, res) => {
 server.requestTimeout = 0;
 
 async function route(req, res) {
-  res.setHeader(
-    'Content-Security-Policy',
-    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-  );
+  res.setHeader('Content-Security-Policy', contentSecurityPolicy);
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer'); // Room IDs are in the URL.
 
@@ -351,6 +501,8 @@ async function route(req, res) {
 
   if (req.method === 'GET' || req.method === 'HEAD') {
     const asset = PAGE_ROUTE.test(pathname) ? assets.page : assets[pathname];
+    // Room links are private, so search engines are asked to keep them out of results.
+    if (asset === assets.page && pathname !== '/') res.setHeader('X-Robots-Tag', 'noindex, nofollow');
     if (asset) return serveAsset(req, res, asset);
   }
   sendJson(res, 404, { error: 'Not found.' });
@@ -414,6 +566,7 @@ function addSocket(ws, room, token) {
       t: 'init',
       you: room.members.get(token),
       users: countPeople(room),
+      locked: Boolean(room.password),
       text: room.document.text,
       v: room.document.version,
       files: [...room.files.values()],

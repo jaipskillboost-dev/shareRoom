@@ -20,3 +20,8 @@ services:
         value: "524288000"
       - key: MAX_TOTAL_BYTES # 1 GB across all rooms
         value: "1073741824"
+      - key: MAX_ROOMS # A small free server cannot hold hundreds of rooms
+        value: "200"
+# Optional: add TURNSTILE_SITE_KEY and TURNSTILE_SECRET in the Render dashboard to require a bot check.
+# They are left out here so the secret never sits in the repository. Link previews need no setting on Render,
+# because Render provides the site's address as RENDER_EXTERNAL_URL.
