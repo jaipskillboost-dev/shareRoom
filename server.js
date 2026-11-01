@@ -10,6 +10,7 @@ const { pipeline } = require('node:stream/promises');
 const { promisify } = require('node:util');
 const { WebSocket, WebSocketServer } = require('ws');
 const { Doc } = require('./public/textsync.js');
+const FileTypes = require('./public/filetypes.js');
 
 const GiB = 1024 ** 3;
 const envNumber = (name, fallback) => Number(process.env[name] ?? fallback);
@@ -56,7 +57,7 @@ const storageRoot = path.join(process.env.STORAGE_DIR ?? os.tmpdir(), 'roomshare
 
 const ROOM_ID_ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'; // No 0/o or 1/i/l, for typing on a phone.
 const ROOM_ID_LENGTH = 8;
-const ROOM_ROUTE = /^\/api\/rooms\/([a-z0-9]{8})(?:\/(join|ws|files)(?:\/([a-f0-9]{32}))?)?$/;
+const ROOM_ROUTE = /^\/api\/rooms\/([a-z0-9]{8})(?:\/(join|ws|files)(?:\/([a-f0-9]{32})(?:\/(view))?)?)?$/;
 const PAGE_ROUTE = /^\/(?:r\/[a-z0-9]{8})?$/;
 
 const rooms = new Map();
@@ -332,25 +333,85 @@ async function uploadFile(req, res, room, rawName) {
   sendJson(res, 201, file);
 }
 
-async function downloadFile(req, res, room, fileId) {
-  const file = room.files.get(fileId);
-  if (!file) return sendJson(res, 404, { error: 'File not found.' });
+const contentDisposition = (disposition, fileName) =>
+  `${disposition}; filename*=UTF-8''${encodeURIComponent(fileName).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16)}`)}`;
 
-  const name = encodeURIComponent(file.name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16)}`);
-  res.writeHead(200, {
-    'Content-Type': 'application/octet-stream', // Always a download: uploads must never run on this origin.
-    'Content-Length': file.size,
-    'Content-Disposition': `attachment; filename*=UTF-8''${name}`,
-    'Cache-Control': 'no-store',
-  });
-
-  const input = fs.createReadStream(path.join(roomDir(room.id), fileId));
-  input.fileId = fileId; // Lets a delete close this stream first, which Windows needs before removing the file.
+// Sends bytes start..end of a stored file. Registered with the room first, so a delete can close it before removing the file.
+async function streamFile(req, res, room, fileId, range) {
+  const input = fs.createReadStream(path.join(roomDir(room.id), fileId), range);
+  input.fileId = fileId;
   room.transfers.add(input);
   req.setTimeout(config.transferIdleMs, () => req.destroy());
   await pipeline(input, res)
     .catch(() => {}) // The downloader went away, or the room ended.
     .finally(() => room.transfers.delete(input));
+}
+
+async function downloadFile(req, res, room, fileId) {
+  const file = room.files.get(fileId);
+  if (!file) return sendJson(res, 404, { error: 'File not found.' });
+
+  res.writeHead(200, {
+    'Content-Type': 'application/octet-stream', // A download never displays: uploads must never run on this origin.
+    'Content-Length': file.size,
+    'Content-Disposition': contentDisposition('attachment', file.name),
+    'Cache-Control': 'no-store',
+  });
+  await streamFile(req, res, room, fileId);
+}
+
+// Understands the one kind of Range header browsers send for video, audio and PDFs: "bytes=start-end".
+// Returns { start, end }, null when there is no usable header (send the whole file), or 'invalid' (answer 416).
+function parseRange(header, size) {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header ?? '');
+  if (!match || (match[1] === '' && match[2] === '')) return null;
+  let start;
+  let end;
+  if (match[1] === '') {
+    const last = Number(match[2]); // "bytes=-500" is the final 500 bytes.
+    if (last === 0) return 'invalid';
+    start = Math.max(0, size - last);
+    end = size - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] === '' ? size - 1 : Math.min(Number(match[2]), size - 1);
+  }
+  return start > end || start >= size ? 'invalid' : { start, end };
+}
+
+// Shows a file in the browser instead of saving it. Three rules keep this safe:
+//  - Only types on the allowlist in filetypes.js are shown, and the type sent is ours, never what the upload claimed.
+//  - Nothing that can run code is ever sent as a page: HTML and scripts go out as plain text.
+//  - Opened on its own, a file is sandboxed (no scripts, no access to this site). PDFs are the one exception,
+//    because browsers' built-in PDF viewers refuse to run inside a sandbox, but they run PDF content in their own isolated context.
+async function viewFile(req, res, room, fileId) {
+  const file = room.files.get(fileId);
+  if (!file) return sendJson(res, 404, { error: 'File not found.' });
+  const { kind, mime } = FileTypes.describe(file.name);
+  if (kind === 'other') {
+    return sendJson(res, 415, { error: 'This kind of file cannot be viewed here. Download it instead.' });
+  }
+
+  const range = parseRange(req.headers.range, file.size);
+  if (range === 'invalid') {
+    res.writeHead(416, { 'Content-Range': `bytes */${file.size}`, 'Cache-Control': 'no-store' });
+    return res.end();
+  }
+  const start = range?.start ?? 0;
+  const end = range?.end ?? file.size - 1;
+
+  res.writeHead(range ? 206 : 200, {
+    'Content-Type': mime,
+    'Content-Length': file.size === 0 ? 0 : end - start + 1,
+    'Content-Disposition': contentDisposition('inline', file.name),
+    'Content-Security-Policy':
+      kind === 'pdf' ? "frame-ancestors 'none'" : "default-src 'none'; style-src 'unsafe-inline'; sandbox; frame-ancestors 'none'",
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+    ...(range && { 'Content-Range': `bytes ${start}-${end}/${file.size}` }),
+  });
+  if (req.method === 'HEAD' || file.size === 0) return res.end();
+  await streamFile(req, res, room, fileId, { start, end });
 }
 
 async function deleteFiles(req, res, room, fileId) {
@@ -375,17 +436,19 @@ async function deleteFiles(req, res, room, fileId) {
 
 /* ---------- Static files, held compressed in RAM ---------- */
 
-// Images are already compressed, so they are kept as they are.
-function buildAsset(type, body, cacheControl, { compress = true } = {}) {
+// Images are already compressed, so they are kept as they are. Large files use a faster, lighter Brotli setting,
+// because the best setting takes seconds on a slow processor and this runs at every startup.
+function buildAsset(type, body, cacheControl, { compress = true, brotliQuality = 11 } = {}) {
   const raw = Buffer.from(body);
+  const brotli = { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: brotliQuality, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: raw.length } };
   return {
     type,
     cacheControl,
     etag: `"${crypto.createHash('sha1').update(raw).digest('base64url')}"`,
     raw,
     compressed: compress,
-    br: compress ? zlib.brotliCompressSync(raw) : null,
-    gzip: compress ? zlib.gzipSync(raw) : null,
+    br: compress ? zlib.brotliCompressSync(raw, brotli) : null,
+    gzip: compress ? zlib.gzipSync(raw, { level: brotliQuality < 11 ? 6 : 9 }) : null,
   };
 }
 
@@ -406,7 +469,12 @@ function loadAssets() {
   const text = (file) => fs.readFileSync(path.join(__dirname, 'public', file), 'utf8');
   const bytes = (file) => fs.readFileSync(path.join(__dirname, 'public', file));
   const script = text('app.js');
-  const scripts = { '/textsync.js': text('textsync.js'), '/theme.js': text('theme.js'), '/qr.js': text('qr.js') };
+  const scripts = {
+    '/textsync.js': text('textsync.js'),
+    '/theme.js': text('theme.js'),
+    '/qr.js': text('qr.js'),
+    '/filetypes.js': text('filetypes.js'),
+  };
   const qrLibrary = text('vendor/qrcode.js');
   const styles = text('style.css');
   // Versioned URLs let browsers cache these forever, so repeat visits need no request for them.
@@ -425,6 +493,11 @@ function loadAssets() {
     '/manifest.webmanifest': buildAsset('application/manifest+json', text('manifest.webmanifest'), daily),
   };
   for (const [url, source] of Object.entries(scripts)) found[url] = buildAsset(js, source, forever);
+  // The PDF reader is loaded only when someone opens a PDF. Its address carries no version, so it is cached for a week.
+  const week = 'public, max-age=604800';
+  for (const file of ['pdf.min.mjs', 'pdf.worker.min.mjs']) {
+    found[`/vendor/pdfjs/${file}`] = buildAsset(js, text(`vendor/pdfjs/${file}`), week, { brotliQuality: 5 });
+  }
   for (const image of ['icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png', 'og-image.png']) {
     found[`/${image}`] = buildAsset('image/png', bytes(image), daily, { compress: false });
   }
@@ -442,6 +515,8 @@ const contentSecurityPolicy = [
   `connect-src 'self'${challenge}`,
   turnstileOn ? `frame-src${challenge}` : null,
   "img-src 'self' data:",
+  "media-src 'self'", // Videos and audio being viewed.
+  "worker-src 'self'", // The PDF reader does its work in a background worker.
   "manifest-src 'self'",
   "base-uri 'none'",
   "form-action 'none'",
@@ -487,14 +562,16 @@ async function route(req, res) {
 
   const match = pathname.match(ROOM_ROUTE);
   if (match) {
-    const [, roomId, action, fileId] = match;
+    const [, roomId, action, fileId, view] = match;
     if (action === 'join' && req.method === 'POST') return joinRoom(req, res, roomId);
     if (action === 'files') {
       const room = memberRoom(req, roomId);
       if (!room) return sendJson(res, 403, { error: 'Join this room first.' });
+      const reading = req.method === 'GET' || req.method === 'HEAD';
       if (!fileId && req.method === 'POST') return uploadFile(req, res, room, url.searchParams.get('name'));
-      if (fileId && req.method === 'GET') return downloadFile(req, res, room, fileId);
-      if (req.method === 'DELETE') return deleteFiles(req, res, room, fileId);
+      if (fileId && view && reading) return viewFile(req, res, room, fileId);
+      if (fileId && !view && req.method === 'GET') return downloadFile(req, res, room, fileId);
+      if (!view && req.method === 'DELETE') return deleteFiles(req, res, room, fileId);
     }
     return sendJson(res, 404, { error: 'Not found.' });
   }

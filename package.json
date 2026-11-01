@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "jsqr": "^1.4.0",
+    "pdfjs-dist": "^6.4.299",
     "qrcode-generator": "^2.0.4"
   }
 }

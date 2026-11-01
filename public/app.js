@@ -108,6 +108,7 @@ function setCreatePasswordOpen(open) {
 }
 
 function showHome(error) {
+  closeViewer();
   roomId = null;
   // Nothing from the room just left may show up in the next one.
   session = new TextSync.Session();
@@ -323,14 +324,24 @@ function handleMessage(data) {
     case 'file':
       addFile(data.file);
       syncStates();
+      updateViewerBar();
       // On a phone the Files tab may be out of sight, so say that something arrived.
       if (stackedLayout.matches && panels.dataset.tab !== 'files') toast(`New file: ${data.file.name}`);
       break;
     case 'fileRemoved':
+      if (viewing?.id === data.id) {
+        closeViewer();
+        toast('That file was deleted.');
+      }
       filesList.querySelector(`[data-id="${data.id}"]`)?.remove();
       syncStates();
+      updateViewerBar();
       break;
     case 'filesCleared':
+      if (viewer.open) {
+        closeViewer();
+        toast('The files were deleted.');
+      }
       filesList.replaceChildren();
       syncStates();
       break;
@@ -362,16 +373,25 @@ function fileBadge(name) {
   return badge;
 }
 
-function fileName(name) {
-  const node = element('div', 'file-name', name);
+// With `onOpen` the name is a button that opens the file in the viewer.
+function fileName(name, onOpen) {
+  const node = onOpen ? element('button', 'file-link', name) : element('div', 'file-name', name);
+  if (onOpen) {
+    node.type = 'button';
+    node.addEventListener('click', onOpen);
+  }
   node.title = name; // Long names are cut to one line, so the full name is on hover and long press.
   return node;
 }
 
 function addFile(file) {
+  const viewable = FileTypes.isViewable(file.name);
   const row = element('li', 'file');
   const info = element('div', 'file-info');
-  info.append(fileName(file.name), element('div', 'file-meta', `${formatSize(file.size)} · ${formatTime(file.at)}`));
+  info.append(
+    fileName(file.name, viewable ? () => openViewer(file.id) : undefined),
+    element('div', 'file-meta', `${formatSize(file.size)} · ${formatTime(file.at)}`),
+  );
 
   const link = element('a', 'icon-btn');
   link.href = `/api/rooms/${roomId}/files/${file.id}`;
@@ -388,8 +408,17 @@ function addFile(file) {
   remove.addEventListener('click', () => deleteFiles(file.id));
 
   const actions = element('div', 'file-actions');
+  if (viewable) {
+    const open = element('button', 'icon-btn');
+    open.type = 'button';
+    open.title = 'View';
+    open.setAttribute('aria-label', `View ${file.name}`);
+    open.append(icon('eye'));
+    open.addEventListener('click', () => openViewer(file.id));
+    actions.append(open);
+  }
   actions.append(link, remove);
-  row.dataset.id = file.id;
+  Object.assign(row.dataset, { id: file.id, name: file.name, size: file.size, viewable });
   row.append(fileBadge(file.name), info, actions);
   filesList.prepend(row);
 }
@@ -470,6 +499,351 @@ async function deleteFiles(fileId) {
     toast('Could not delete. Check your connection and try again.', { error: true });
   }
 }
+
+/* ---------- Viewing files ---------- */
+
+const viewer = $('viewer');
+const viewerBody = $('viewer-body');
+let viewing = null; // The file on screen: { id, controller, cleanup }.
+
+const viewUrl = (id) => `/api/rooms/${roomId}/files/${id}/view`;
+const downloadUrl = (id) => `/api/rooms/${roomId}/files/${id}`;
+const viewableRows = () => [...filesList.children].filter((row) => row.dataset.viewable === 'true');
+
+function loadingNode() {
+  const box = element('div', 'viewer-message');
+  box.setAttribute('role', 'status');
+  box.append(element('div', 'spinner'), element('p', '', 'Loading…'));
+  return box;
+}
+
+function viewerMessage(text, fileId) {
+  const box = element('div', 'viewer-message');
+  box.append(element('p', '', text));
+  if (fileId) {
+    const link = element('a', 'btn', 'Download');
+    link.href = downloadUrl(fileId);
+    link.download = '';
+    box.append(link);
+  }
+  viewerBody.replaceChildren(box);
+}
+
+// Stops everything the last file was doing. Video and PDFs would otherwise keep downloading in the background.
+function endViewing() {
+  if (!viewing) return;
+  viewing.controller.abort();
+  viewing.cleanup?.();
+  viewing = null;
+  viewerBody.replaceChildren();
+}
+
+// The title, position in the list, and the previous and next buttons.
+function updateViewerBar() {
+  if (!viewer.open || !viewing) return;
+  const rows = viewableRows();
+  const at = rows.findIndex((row) => row.dataset.id === viewing.id);
+  if (at < 0) return;
+  const row = rows[at];
+  const { extension } = FileTypes.describe(row.dataset.name);
+  $('viewer-title').textContent = row.dataset.name;
+  const meta = [`${at + 1} of ${rows.length}`, formatSize(Number(row.dataset.size)), extension.toUpperCase()];
+  if (viewing.pages) meta.push(`${viewing.pages} page${viewing.pages === 1 ? '' : 's'}`);
+  $('viewer-meta').textContent = meta.filter(Boolean).join(' · ');
+  $('viewer-prev').disabled = at === 0;
+  $('viewer-next').disabled = at === rows.length - 1;
+}
+
+const renderers = {
+  async image(current, { id }) {
+    const picture = element('img', 'viewer-image');
+    picture.alt = '';
+    picture.decoding = 'async';
+    picture.addEventListener('click', () => picture.classList.toggle('zoomed')); // Tap to see it at full size.
+    const loaded = new Promise((resolve, reject) => {
+      picture.onload = resolve;
+      picture.onerror = () => reject(new Error('The browser could not show this image.'));
+    });
+    picture.src = viewUrl(id);
+    current.cleanup = () => {
+      picture.onload = picture.onerror = null;
+      picture.removeAttribute('src');
+    };
+    await loaded;
+    if (viewing === current) viewerBody.replaceChildren(picture);
+  },
+
+  async video(current, { id }) {
+    const clip = element('video', 'viewer-video');
+    clip.controls = true;
+    clip.playsInline = true;
+    clip.preload = 'metadata'; // Nothing but the start is fetched until play is pressed.
+    const ready = new Promise((resolve, reject) => {
+      clip.onloadedmetadata = resolve;
+      clip.onerror = () => reject(new Error('The browser could not play this video.'));
+    });
+    clip.src = viewUrl(id);
+    current.cleanup = () => {
+      clip.pause();
+      clip.onloadedmetadata = clip.onerror = null;
+      clip.removeAttribute('src');
+      clip.load(); // Drops the connection, so a half-watched video stops using bandwidth.
+    };
+    await ready;
+    if (viewing === current) viewerBody.replaceChildren(clip);
+  },
+
+  async audio(current, { id, name }) {
+    const card = element('div', 'viewer-audio');
+    const player = element('audio');
+    player.controls = true;
+    player.preload = 'metadata';
+    const ready = new Promise((resolve, reject) => {
+      player.onloadedmetadata = resolve;
+      player.onerror = () => reject(new Error('The browser could not play this audio.'));
+    });
+    player.src = viewUrl(id);
+    card.append(icon('music'), element('p', '', name), player);
+    current.cleanup = () => {
+      player.pause();
+      player.onloadedmetadata = player.onerror = null;
+      player.removeAttribute('src');
+      player.load();
+    };
+    await ready;
+    if (viewing === current) viewerBody.replaceChildren(card);
+  },
+
+  async text(current, { id, name, size }) {
+    const limit = 1024 * 1024;
+    const response = await fetch(viewUrl(id), { headers: { Range: `bytes=0-${limit - 1}` }, signal: current.controller.signal });
+    if (!response.ok) throw new Error('The file could not be read.');
+    const bytes = await response.arrayBuffer();
+    if (viewing !== current) return;
+
+    let text = new TextDecoder().decode(bytes);
+    const truncated = size > bytes.byteLength;
+    const extension = FileTypes.extension(name);
+    const note = truncated
+      ? element('p', 'viewer-note', `Showing the first ${formatSize(limit)} of ${formatSize(size)}. Download the file to see the rest.`)
+      : null;
+
+    if (extension === 'csv' || extension === 'tsv') {
+      const rows = parseDelimited(text, extension === 'tsv' ? '\t' : ',');
+      const table = element('table', 'viewer-table');
+      const head = element('thead');
+      const body = element('tbody');
+      rows.forEach((cells, index) => {
+        const tr = element('tr');
+        for (const cell of cells) tr.append(element(index === 0 ? 'th' : 'td', '', cell));
+        (index === 0 ? head : body).append(tr);
+      });
+      table.append(head, body);
+      const wrap = element('div', 'viewer-table-wrap');
+      wrap.append(...(note ? [note] : []), table);
+      viewerBody.replaceChildren(wrap);
+      return;
+    }
+
+    if (extension === 'json' && !truncated) {
+      try {
+        text = JSON.stringify(JSON.parse(text), null, 2);
+      } catch {} // Not valid JSON, so it is shown as it is.
+    }
+    const box = element('div', 'viewer-text');
+    if (note) box.append(note);
+    box.append(document.createTextNode(text)); // Always text, never markup.
+    viewerBody.replaceChildren(box);
+  },
+
+  async pdf(current, { id }) {
+    const library = await loadPdfLibrary();
+    const task = library.getDocument({ url: viewUrl(id) });
+    let observer = null;
+    let resizer = null;
+    current.cleanup = () => {
+      observer?.disconnect();
+      resizer?.disconnect();
+      task.destroy();
+    };
+    const pdf = await task.promise;
+    if (viewing !== current) return;
+    current.pages = pdf.numPages;
+    updateViewerBar();
+
+    const first = await pdf.getPage(1);
+    const natural = first.getViewport({ scale: 1 });
+    const holder = element('div', 'viewer-pdf');
+
+    // Pages are drawn only while near the screen and cleared when far away, so a long PDF cannot exhaust a phone's memory.
+    async function paint(slot, cssWidth) {
+      if (slot.painted || slot.painting) return;
+      slot.painting = true;
+      try {
+        const page = await pdf.getPage(Number(slot.dataset.page));
+        const size = page.getViewport({ scale: 1 });
+        const sharpness = Math.min(window.devicePixelRatio || 1, 2);
+        const scale = Math.min((cssWidth / size.width) * sharpness, Math.sqrt(12_000_000 / (size.width * size.height)));
+        const viewport = page.getViewport({ scale });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.floor(viewport.width);
+        canvas.height = Math.floor(viewport.height);
+        canvas.style.width = `${cssWidth}px`;
+        slot.style.height = `${Math.round((cssWidth * size.height) / size.width)}px`;
+        slot.replaceChildren(canvas);
+        slot.task = page.render({ canvas, canvasContext: canvas.getContext('2d'), viewport });
+        await slot.task.promise;
+        slot.painted = true;
+      } catch {
+        // Scrolling away cancels a page that is still being drawn.
+      } finally {
+        slot.painting = false;
+        if (slot.wanted && !slot.painted && viewing === current) paint(slot, cssWidth);
+      }
+    }
+
+    function release(slot) {
+      slot.task?.cancel();
+      slot.replaceChildren();
+      slot.painted = false;
+    }
+
+    function layout() {
+      observer?.disconnect();
+      const cssWidth = Math.max(200, Math.min(viewerBody.clientWidth - 24, 900));
+      const cssHeight = Math.round((cssWidth * natural.height) / natural.width);
+      const slots = Array.from({ length: pdf.numPages }, (_, index) => {
+        const slot = element('div', 'pdf-page');
+        slot.dataset.page = index + 1;
+        slot.style.width = `${cssWidth}px`;
+        slot.style.height = `${cssHeight}px`;
+        return slot;
+      });
+      holder.replaceChildren(...slots);
+      observer = new IntersectionObserver(
+        (entries) => {
+          for (const { target, isIntersecting } of entries) {
+            target.wanted = isIntersecting;
+            if (isIntersecting) paint(target, cssWidth);
+            else release(target);
+          }
+        },
+        { root: viewerBody, rootMargin: '120% 0px' },
+      );
+      slots.forEach((slot) => observer.observe(slot));
+    }
+
+    layout();
+    viewerBody.replaceChildren(holder);
+
+    // Turning a phone sideways changes the width, so the pages are laid out again.
+    let width = viewerBody.clientWidth;
+    resizer = new ResizeObserver(() => {
+      if (Math.abs(viewerBody.clientWidth - width) < 8) return;
+      width = viewerBody.clientWidth;
+      layout();
+    });
+    resizer.observe(viewerBody);
+  },
+};
+
+let pdfLibrary = null;
+function loadPdfLibrary() {
+  // The reader is large, so it is fetched only the first time a PDF is opened.
+  pdfLibrary ??= import('/vendor/pdfjs/pdf.min.mjs').then((library) => {
+    library.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.min.mjs';
+    return library;
+  });
+  pdfLibrary.catch(() => {
+    pdfLibrary = null; // So that opening another PDF tries again.
+  });
+  return pdfLibrary;
+}
+
+// Reads comma- or tab-separated text, including quoted cells. Enough rows to look at, not to edit.
+function parseDelimited(text, delimiter) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let quoted = false;
+  for (let i = 0; i < text.length && rows.length < 2000; i += 1) {
+    const char = text[i];
+    if (quoted) {
+      if (char !== '"') cell += char;
+      else if (text[i + 1] === '"') {
+        cell += '"';
+        i += 1;
+      } else quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === delimiter) {
+      row.push(cell);
+      cell = '';
+    } else if (char === '\n') {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else if (char !== '\r') cell += char;
+  }
+  if (cell || row.length) rows.push([...row, cell]);
+  return rows;
+}
+
+async function showInViewer(index) {
+  const row = viewableRows()[index];
+  if (!row) return;
+  endViewing();
+  const file = { id: row.dataset.id, name: row.dataset.name, size: Number(row.dataset.size) };
+  const current = (viewing = { id: file.id, controller: new AbortController(), cleanup: null, pages: 0 });
+  updateViewerBar();
+  $('viewer-open').href = viewUrl(file.id);
+  $('viewer-download').href = downloadUrl(file.id);
+  $('viewer-download').download = file.name;
+  viewerBody.replaceChildren(loadingNode());
+  viewerBody.scrollTop = 0;
+
+  try {
+    await renderers[FileTypes.describe(file.name).kind](current, file);
+  } catch (error) {
+    if (viewing !== current || error.name === 'AbortError') return;
+    viewerMessage(
+      error.name === 'PasswordException'
+        ? 'This PDF is protected by a password. Download it to open it.'
+        : `${error.message?.startsWith('The ') ? error.message : 'This file could not be shown.'} Download it to open it instead.`,
+      file.id,
+    );
+  }
+}
+
+function openViewer(fileId) {
+  const index = viewableRows().findIndex((row) => row.dataset.id === fileId);
+  if (index < 0) return;
+  if (!viewer.open) viewer.showModal();
+  showInViewer(index);
+}
+
+function closeViewer() {
+  if (viewer.open) viewer.close();
+  endViewing();
+}
+
+function stepViewer(step) {
+  const rows = viewableRows();
+  const next = rows.findIndex((row) => row.dataset.id === viewing?.id) + step;
+  if (viewing && next >= 0 && next < rows.length) showInViewer(next);
+}
+
+$('viewer-close').addEventListener('click', closeViewer);
+$('viewer-prev').addEventListener('click', () => stepViewer(-1));
+$('viewer-next').addEventListener('click', () => stepViewer(1));
+viewer.addEventListener('close', endViewing); // Also runs when Esc closes it.
+viewer.addEventListener('keydown', (event) => {
+  if (event.target.closest?.('audio, video, input, textarea')) return; // Those use the arrow keys themselves.
+  if (event.key === 'ArrowLeft') stepViewer(-1);
+  else if (event.key === 'ArrowRight') stepViewer(1);
+  else return;
+  event.preventDefault();
+});
 
 /* ---------- Buttons ---------- */
 

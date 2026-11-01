@@ -13,6 +13,7 @@ Open the site, create a room, and open the link on your phone, tablet or another
 - **Invite with a QR code.** Share opens a dialog with a QR code and the link. Point a phone camera at it to join, or copy the link.
 - **Optional room password.** Choose "Protect with a password" when creating a room. Anyone opening the link is asked for it, a lock icon shows inside the room, and repeated wrong guesses are blocked.
 - **Paste images.** Press Ctrl+V with a screenshot or photo copied (or use the Paste button) and it uploads to Files, named by date and time.
+- **View files without downloading.** Tap a file (or its eye icon) to open it full-screen: pictures, video and audio play, PDFs read page by page even on phones, and text, code, JSON and CSV files show on the spot. Step through the files with the arrows, and nothing is saved to your device.
 - **Installable.** Add it to the home screen of a phone or the desktop and it opens like an app, with its own icon.
 - **Link previews.** A room link shared in WhatsApp, Slack or similar shows the RoomShare name and a picture. The preview never reveals anything about the room.
 - **Optional bot check.** Free Cloudflare Turnstile can be switched on to stop automated room creation. It is off unless you set its keys.
@@ -32,7 +33,7 @@ npm start        # http://localhost:3000
 To try it from a phone on the same Wi-Fi, open `http://<your-computer's-address>:3000`. Allow Node.js through the firewall if asked. Over plain `http://` on a network address the browser may block the Paste button, so use Ctrl+V or a long press instead. It works normally over HTTPS.
 
 ```bash
-npm test         # 57 tests, a few seconds
+npm test         # 78 tests, a few seconds
 ```
 
 ## How it works
@@ -63,16 +64,46 @@ roomShare/
 │   ├── textsync.js       Merges simultaneous typing (runs in browser and server)
 │   ├── theme.js          Light/dark switch, applied before the page paints
 │   ├── qr.js             Turns a link into QR code image data
+│   ├── filetypes.js      Decides which files can be viewed, and as what (runs in browser and server)
 │   ├── vendor/qrcode.js  QR encoder by Kazuhiko Arase (MIT), copied from npm
+│   ├── vendor/pdfjs/     Mozilla's PDF reader (Apache-2.0), loaded only when a PDF is opened
 │   ├── manifest.webmanifest, icon-*.png, apple-touch-icon.png   Installable-app files
 │   └── og-image.png      Picture shown in link previews
 └── test/
     ├── rooms.test.js       Server tests: access, files, text, online count, cleanup
     ├── protection.test.js  Passwords, lockout, bot check, room cap, security policy
     ├── assets.test.js      Manifest, icons, link-preview tags, robots header
+    ├── view.test.js        Viewing files: types, sandboxing, range requests, access
+    ├── filetypes.test.js   Which names are viewable, and that nothing runnable gets a runnable type
     ├── qr.test.js          Draws QR codes and decodes them back with a separate reader
     └── textsync.test.js    Merge engine tests and random-typing simulation
 ```
+
+## Viewing files
+
+| Kind | Examples | Shown as |
+| --- | --- | --- |
+| Pictures | png, jpg, gif, webp, avif, bmp, ico, svg | The picture, fitted to the screen. Tap to see it at full size |
+| Video | mp4, webm, mov, m4v, ogv | A player with seeking. Whether a file plays depends on the codecs in the person's browser |
+| Audio | mp3, wav, m4a, aac, ogg, opus, flac | A player |
+| PDF | pdf | Pages drawn one after another. Only pages near the screen are in memory, so long PDFs are safe on phones |
+| Text | txt, md, log, json, code (js, py, html, css...) | The text. JSON is indented. HTML is shown as its source, never as a page |
+| Tables | csv, tsv | A table of the first 2,000 rows |
+
+Anything else (Word, Excel, PowerPoint, zip, HEIC photos) shows no View button and can only be downloaded. Text files show their first 1 MB.
+
+How it stays safe:
+
+- The file's type comes from a fixed list in `public/filetypes.js`, chosen by the file name. The server never trusts the type an upload claims, and sends `nosniff` so a browser cannot decide a picture is really a web page.
+- Nothing that can run code is ever sent as a page. HTML and scripts go out as plain text.
+- Opened on its own ("Open in a new tab"), a file is sandboxed: no scripts, and no access to the site or its cookies. A script hidden inside an SVG does nothing. PDFs are the one exception, because browsers refuse to show a PDF inside a sandbox. They still run PDF content in the viewer's own isolated area.
+- Only people inside the room can view a file. Deleting a file closes it for anyone watching.
+
+Things to know:
+
+- **Viewing uses bandwidth like downloading does.** On hosts with a monthly allowance (Render's free plan has 5 GB), watching a video counts. Videos and PDFs are fetched in pieces, so only the part you look at is sent, and closing the viewer stops the transfer.
+- **No thumbnails in the file list.** They would make every person's browser download every picture each time the room opens.
+- The PDF reader is large (about 1.8 MB), so it is only fetched the first time someone opens a PDF. Text inside PDFs cannot be selected yet, because pages are drawn as pictures.
 
 ## Configuration
 
@@ -157,4 +188,4 @@ Anything that runs `npm start` behind HTTPS will do, as long as it is a single i
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The bundled QR encoder in `public/vendor/qrcode.js` is [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) by Kazuhiko Arase, also MIT. "QR Code" is a registered trademark of Denso Wave Incorporated.
+MIT. See [LICENSE](LICENSE). The bundled QR encoder in `public/vendor/qrcode.js` is [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) by Kazuhiko Arase, also MIT. "QR Code" is a registered trademark of Denso Wave Incorporated. The PDF reader in `public/vendor/pdfjs/` is [PDF.js](https://github.com/mozilla/pdf.js) by Mozilla, under the Apache License 2.0 (its text is in that folder).

@@ -77,6 +77,25 @@ test('every script and stylesheet the page loads is served', async () => {
   for (const url of new Set(urls)) assert.equal((await fetch(base + url)).status, 200, url);
 });
 
+test('the PDF reader and its background worker are served, compressed, as scripts', async () => {
+  for (const file of ['pdf.min.mjs', 'pdf.worker.min.mjs']) {
+    const response = await fetch(`${base}/vendor/pdfjs/${file}`, { headers: { 'accept-encoding': 'br' } });
+    assert.equal(response.status, 200, file);
+    assert.equal(response.headers.get('content-type'), 'text/javascript; charset=utf-8', file);
+    assert.equal(response.headers.get('content-encoding'), 'br', file);
+    assert.match(response.headers.get('cache-control'), /max-age=604800/);
+    assert.ok(Number(response.headers.get('content-length')) > 100_000, `${file} is the real library, not an error page`);
+  }
+});
+
+test('the security policy lets the page play media and run the PDF worker, from itself only', async () => {
+  const policy = (await fetch(`${base}/`)).headers.get('content-security-policy');
+  assert.match(policy, /media-src 'self'(;|$)/);
+  assert.match(policy, /worker-src 'self'(;|$)/);
+  assert.match(policy, /default-src 'none'/);
+  assert.ok(!policy.includes('blob:') && !policy.includes('unsafe-eval') && !policy.includes('unsafe-inline'));
+});
+
 test('room links ask search engines to stay out, and the home page does not', async () => {
   assert.equal((await fetch(`${base}/r/abcdefgh`)).headers.get('x-robots-tag'), 'noindex, nofollow');
   assert.equal((await fetch(`${base}/`)).headers.get('x-robots-tag'), null);

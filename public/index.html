@@ -33,6 +33,7 @@
   <script src="/textsync.js?v=__VERSION__" defer></script>
   <script src="/vendor/qrcode.js?v=__VERSION__" defer></script>
   <script src="/qr.js?v=__VERSION__" defer></script>
+  <script src="/filetypes.js?v=__VERSION__" defer></script>
   <script src="/app.js?v=__VERSION__" defer></script>
 </head>
 <body>
@@ -56,6 +57,12 @@
     <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9z"/></symbol>
     <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
     <symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14L21 3"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
+    <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></symbol>
     <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
     <symbol id="i-download-app" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="3"/><path d="M12 7v7M9 11l3 3 3-3M10 18h4"/></symbol>
   </svg>
@@ -255,6 +262,33 @@
         <button id="confirm-ok" class="btn danger-solid" type="button"></button>
       </div>
     </div>
+  </dialog>
+
+  <dialog id="viewer" class="viewer" aria-labelledby="viewer-title">
+    <header class="viewer-bar">
+      <div class="viewer-heading">
+        <h2 id="viewer-title" class="viewer-title"></h2>
+        <p id="viewer-meta" class="viewer-meta"></p>
+      </div>
+      <div class="viewer-actions">
+        <button id="viewer-prev" class="viewer-btn" type="button" aria-label="Previous file" title="Previous file (left arrow)">
+          <svg class="icon" aria-hidden="true"><use href="#i-chevron-left"/></svg>
+        </button>
+        <button id="viewer-next" class="viewer-btn" type="button" aria-label="Next file" title="Next file (right arrow)">
+          <svg class="icon" aria-hidden="true"><use href="#i-chevron-right"/></svg>
+        </button>
+        <a id="viewer-open" class="viewer-btn" target="_blank" rel="noopener" aria-label="Open in a new tab" title="Open in a new tab">
+          <svg class="icon" aria-hidden="true"><use href="#i-external"/></svg>
+        </a>
+        <a id="viewer-download" class="viewer-btn" aria-label="Download" title="Download">
+          <svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>
+        </a>
+        <button id="viewer-close" class="viewer-btn" type="button" aria-label="Close" title="Close (Esc)">
+          <svg class="icon" aria-hidden="true"><use href="#i-close"/></svg>
+        </button>
+      </div>
+    </header>
+    <div id="viewer-body" class="viewer-body"></div>
   </dialog>
 
   <dialog id="invite" class="modal" aria-labelledby="invite-title">
