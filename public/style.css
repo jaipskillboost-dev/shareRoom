@@ -199,6 +199,8 @@ button { cursor: pointer; }
   box-shadow: var(--shadow);
 }
 
+.home-actions { display: flex; flex-direction: column; align-items: stretch; }
+
 .logo {
   width: 56px;
   height: 56px;
@@ -677,6 +679,52 @@ button { cursor: pointer; }
   .panels[data-tab="files"] #panel-message,
   .panels[data-tab="message"] #panel-files { display: flex; }
   .panel { min-height: 0; padding: 20px; }
+}
+
+/* Laptops and desktops: the home card becomes a wide two-column layout instead of a phone-sized column. */
+@media (min-width: 1024px) {
+  .home { padding: 48px; }
+  .theme-corner { top: 24px; right: 28px; }
+  .home-card {
+    max-width: 1040px;
+    padding: 56px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 420px);
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas: "intro actions" "points actions" "install actions";
+    column-gap: 64px;
+    border-radius: 28px;
+    box-shadow: var(--shadow-lg);
+  }
+  .home-intro { grid-area: intro; }
+  .logo { width: 64px; height: 64px; margin-bottom: 24px; border-radius: 18px; }
+  .logo .icon { width: 32px; height: 32px; }
+  .home-card h1 { font-size: 48px; }
+  .lead { margin: 14px 0 0; max-width: 24em; font-size: 18px; line-height: 1.55; }
+  .home-actions {
+    grid-area: actions;
+    align-self: center;
+    padding: 28px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+  }
+  .points { grid-area: points; align-self: end; margin-top: 32px; }
+  .points li { font-size: 15px; }
+  .link-btn.install { grid-area: install; align-self: start; justify-self: start; margin-top: 14px; }
+}
+
+/* Wide windows: the room fills more of the screen and its text grows a little. */
+@media (min-width: 1200px) {
+  .room { max-width: 1560px; padding: 24px 32px; gap: 16px; }
+  .topbar { padding: 12px 18px; }
+  .panels { gap: 20px; }
+  .panel { padding: 24px; gap: 16px; }
+  .panel h2 { font-size: 18px; }
+  .panel-sub { font-size: 14px; }
+  .dropzone { padding: 26px 20px; }
+  .file { padding: 12px 0; }
+  .shared-text { font-size: 17px; padding: 16px 18px; }
 }
 
 /* Small phones: icons carry the buttons, and the tight header drops its title. */

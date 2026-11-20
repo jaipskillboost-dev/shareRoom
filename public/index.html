@@ -74,45 +74,49 @@
     </button>
 
     <div class="home-card">
-      <div class="logo" aria-hidden="true"><svg class="icon"><use href="#i-sync"/></svg></div>
-      <h1>RoomShare</h1>
-      <p class="lead">Send files and text between your phone, tablet and computer. No account, no install.</p>
-
-      <div id="turnstile" class="turnstile" hidden></div>
-
-      <button id="create-room" class="btn primary lg wide" type="button">
-        <span>Create a room</span>
-        <svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg>
-      </button>
-
-      <button id="password-toggle" class="link-btn" type="button" aria-expanded="false" aria-controls="create-password-row">
-        <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>
-        <span>Protect with a password (optional)</span>
-      </button>
-      <div id="create-password-row" class="password-row" hidden>
-        <label class="visually-hidden" for="create-password">Room password</label>
-        <input id="create-password" class="field" type="password" maxlength="128" placeholder="Choose a password"
-               autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false">
-        <p class="field-hint">People will need this password, as well as the link, to join.</p>
+      <div class="home-intro">
+        <div class="logo" aria-hidden="true"><svg class="icon"><use href="#i-sync"/></svg></div>
+        <h1>RoomShare</h1>
+        <p class="lead">Send files and text between your phone, tablet and computer. No account, no install.</p>
       </div>
 
-      <p class="divider"><span>or join with a room ID</span></p>
+      <div class="home-actions">
+        <div id="turnstile" class="turnstile" hidden></div>
 
-      <form id="join-form" class="join-form" novalidate>
-        <div class="join-row">
-          <label class="visually-hidden" for="room-input">Room ID</label>
-          <input id="room-input" class="field code-field" type="text" inputmode="text" placeholder="Room ID or link"
-                 autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go" required>
-          <button class="btn lg" type="submit">Join</button>
-        </div>
-        <div id="join-password-row" class="password-row" hidden>
-          <label class="visually-hidden" for="join-password">Room password</label>
-          <input id="join-password" class="field" type="password" maxlength="128" placeholder="This room needs a password"
-                 autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go">
-        </div>
-      </form>
+        <button id="create-room" class="btn primary lg wide" type="button">
+          <span>Create a room</span>
+          <svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg>
+        </button>
 
-      <p id="home-error" class="form-error" role="alert" hidden></p>
+        <button id="password-toggle" class="link-btn" type="button" aria-expanded="false" aria-controls="create-password-row">
+          <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>
+          <span>Protect with a password (optional)</span>
+        </button>
+        <div id="create-password-row" class="password-row" hidden>
+          <label class="visually-hidden" for="create-password">Room password</label>
+          <input id="create-password" class="field" type="password" maxlength="128" placeholder="Choose a password"
+                 autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false">
+          <p class="field-hint">People will need this password, as well as the link, to join.</p>
+        </div>
+
+        <p class="divider"><span>or join with a room ID</span></p>
+
+        <form id="join-form" class="join-form" novalidate>
+          <div class="join-row">
+            <label class="visually-hidden" for="room-input">Room ID</label>
+            <input id="room-input" class="field code-field" type="text" inputmode="text" placeholder="Room ID or link"
+                   autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go" required>
+            <button class="btn lg" type="submit">Join</button>
+          </div>
+          <div id="join-password-row" class="password-row" hidden>
+            <label class="visually-hidden" for="join-password">Room password</label>
+            <input id="join-password" class="field" type="password" maxlength="128" placeholder="This room needs a password"
+                   autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go">
+          </div>
+        </form>
+
+        <p id="home-error" class="form-error" role="alert" hidden></p>
+      </div>
 
       <ul class="points">
         <li><svg class="icon" aria-hidden="true"><use href="#i-bolt"/></svg><span>Instant. Everything updates live as you type.</span></li>
