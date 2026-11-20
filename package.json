@@ -1,23 +1,27 @@
 {
   "name": "roomshare",
   "version": "1.0.0",
-  "description": "Temporary rooms for sharing files and text between devices. No accounts, no database.",
+  "description": "Temporary rooms for sharing files and text between devices. No accounts, no database. Runs on Cloudflare Workers.",
   "license": "MIT",
   "private": true,
-  "main": "server.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12"
   },
   "scripts": {
-    "start": "node server.js",
-    "test": "node --test"
+    "build": "node scripts/build-assets.mjs",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "ws": "^8.22.1"
+    "aws4fetch": "^1.0.20"
   },
   "devDependencies": {
     "jsqr": "^1.4.0",
     "pdfjs-dist": "^6.4.299",
-    "qrcode-generator": "^2.0.4"
+    "qrcode-generator": "^2.0.4",
+    "wrangler": "^4.165.0",
+    "ws": "^8.22.1"
   }
 }

@@ -1,0 +1,44 @@
+// RoomShare on Cloudflare Workers (free plan). See README.md for setup.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "roomshare",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-15",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Fills in the page and writes dist/ before every `wrangler dev` and `wrangler deploy`.
+  "build": { "command": "node scripts/build-assets.mjs", "watch_dir": ["public", "src/shared.js"] },
+
+  // Pages, scripts and icons are served straight from dist/. Requests for them are free and do not run the Worker.
+  "assets": {
+    "directory": "dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/r/*"]
+  },
+
+  // One Durable Object per room, plus a single "gate" that holds the site-wide counts.
+  // SQLite-backed objects are the kind the free plan includes.
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOM", "class_name": "Room" },
+      { "name": "GATE", "class_name": "Gate" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room", "Gate"] }],
+
+  // File contents. Keys are "<roomId>/<fileId>".
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "roomshare-files" }],
+
+  "vars": {
+    // The site's public address, used in link previews. Set it to your workers.dev address after the first deploy.
+    "PUBLIC_URL": "",
+    // Your Cloudflare account ID. With it, and the R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY secrets,
+    // uploads go straight from the browser to R2. Leave it empty to send uploads through the Worker (100 MB limit).
+    "R2_ACCOUNT_ID": "",
+    "R2_BUCKET": "roomshare-files",
+    // Optional bot check. Set the site key here and TURNSTILE_SECRET as a secret.
+    "TURNSTILE_SITE_KEY": ""
+  },
+
+  "observability": { "enabled": true }
+}
