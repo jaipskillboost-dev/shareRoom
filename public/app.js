@@ -206,11 +206,19 @@ function connect() {
   const ws = new WebSocket(`${protocol}://${location.host}/api/rooms/${roomId}/ws`);
   socket = ws;
 
-  ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
+  ws.onmessage = (event) => {
+    if (event.data !== 'pong') handleMessage(JSON.parse(event.data));
+  };
   ws.onclose = () => {
     if (socket === ws && roomId) scheduleReconnect();
   };
 }
+
+// Tells the server this tab is still here. A phone that loses signal stops sending these, and the server notices.
+// Cloudflare answers them without waking the room, so they cost nothing.
+setInterval(() => {
+  if (socket?.readyState === WebSocket.OPEN) socket.send('ping');
+}, 15_000);
 
 function scheduleReconnect(delay = Math.min(500 * 2 ** reconnectAttempts, 5000)) {
   clearTimeout(reconnectTimer);
@@ -457,33 +465,49 @@ function uploadFile(file) {
     return Promise.resolve();
   }
 
-  return new Promise((resolve) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/rooms/${roomId}/files?name=${encodeURIComponent(file.name)}`);
-    xhr.upload.onprogress = (event) => {
-      if (!event.lengthComputable) return;
-      bar.value = event.loaded / event.total;
-      status.textContent = `${formatSize(event.loaded)} of ${formatSize(event.total)}`;
-    };
-    xhr.onload = () => {
-      if (xhr.status === 201) {
-        row.remove();
-        syncStates();
-      } else {
-        let reason = 'Upload failed.';
-        try {
-          reason = JSON.parse(xhr.responseText).error ?? reason;
-        } catch {}
-        fail(reason);
-      }
-      resolve();
-    };
-    xhr.onerror = () => {
-      fail('Upload failed. Check your connection and try again.');
-      resolve();
-    };
-    xhr.send(file);
-  });
+  const room = roomId;
+  const offline = 'Upload failed. Check your connection and try again.';
+  const errorOf = async (response) => (await response.json().catch(() => ({}))).error ?? 'Upload failed.';
+
+  // Three steps: reserve space and get an upload link, send the file to that link, then tell the room it arrived.
+  // The link usually goes straight to file storage, so large files never pass through the server.
+  return (async () => {
+    let slot;
+    try {
+      const response = await fetch(`/api/rooms/${room}/uploads`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: file.name, size: file.size }),
+      });
+      if (!response.ok) return fail(await errorOf(response));
+      slot = await response.json();
+    } catch {
+      return fail(offline);
+    }
+
+    const sent = await new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', slot.url);
+      xhr.upload.onprogress = (event) => {
+        if (!event.lengthComputable) return;
+        bar.value = event.loaded / event.total;
+        status.textContent = `${formatSize(event.loaded)} of ${formatSize(event.total)}`;
+      };
+      xhr.onload = () => resolve(xhr.status >= 200 && xhr.status < 300);
+      xhr.onerror = () => resolve(false);
+      xhr.send(file);
+    });
+    if (!sent) return fail(offline);
+
+    try {
+      const response = await fetch(`/api/rooms/${room}/uploads/${slot.id}/complete`, { method: 'POST' });
+      if (!response.ok) return fail(await errorOf(response));
+    } catch {
+      return fail(offline);
+    }
+    row.remove();
+    syncStates();
+  })();
 }
 
 async function uploadAll(files) {
