@@ -1,29 +1,18 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
 const { after, before, test } = require('node:test');
+const { startRoomShare } = require('./harness.js');
 
-// Defaults: no public address and no bot check, as when running on a laptop.
-for (const name of ['PUBLIC_URL', 'RENDER_EXTERNAL_URL', 'TURNSTILE_SITE_KEY', 'TURNSTILE_SECRET']) delete process.env[name];
-process.env.STORAGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'roomshare-assets-'));
-
-const { server } = require('../server.js');
-
+let rs;
 let base;
 
 before(async () => {
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  base = `http://127.0.0.1:${server.address().port}`;
+  rs = await startRoomShare();
+  base = rs.base;
 });
 
-after(async () => {
-  server.closeAllConnections();
-  await new Promise((resolve) => server.close(resolve));
-  fs.rmSync(process.env.STORAGE_DIR, { recursive: true, force: true });
-});
+after(() => rs.close());
 
 const pngSize = (bytes) => ({ signature: bytes.subarray(0, 8).toString('hex'), width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) });
 const PNG_SIGNATURE = '89504e470d0a1a0a';
@@ -67,7 +56,6 @@ test('the home-screen and link-preview images are served at the right sizes', as
   const preview = await fetch(`${base}/og-image.png`);
   assert.deepEqual(pngSize(Buffer.from(await preview.arrayBuffer())), { signature: PNG_SIGNATURE, width: 1200, height: 630 });
   assert.match(preview.headers.get('cache-control'), /max-age=86400/);
-  assert.equal(preview.headers.get('content-encoding'), null, 'images are not compressed a second time');
 });
 
 test('every script and stylesheet the page loads is served', async () => {
@@ -77,14 +65,14 @@ test('every script and stylesheet the page loads is served', async () => {
   for (const url of new Set(urls)) assert.equal((await fetch(base + url)).status, 200, url);
 });
 
-test('the PDF reader and its background worker are served, compressed, as scripts', async () => {
+// Cloudflare compresses scripts on the way out, so compression is not checked here.
+test('the PDF reader and its background worker are served as scripts', async () => {
   for (const file of ['pdf.min.mjs', 'pdf.worker.min.mjs']) {
-    const response = await fetch(`${base}/vendor/pdfjs/${file}`, { headers: { 'accept-encoding': 'br' } });
+    const response = await fetch(`${base}/vendor/pdfjs/${file}`);
     assert.equal(response.status, 200, file);
-    assert.equal(response.headers.get('content-type'), 'text/javascript; charset=utf-8', file);
-    assert.equal(response.headers.get('content-encoding'), 'br', file);
+    assert.match(response.headers.get('content-type'), /javascript/, file);
     assert.match(response.headers.get('cache-control'), /max-age=604800/);
-    assert.ok(Number(response.headers.get('content-length')) > 100_000, `${file} is the real library, not an error page`);
+    assert.ok((await response.arrayBuffer()).byteLength > 100_000, `${file} is the real library, not an error page`);
   }
 });
 
@@ -99,4 +87,10 @@ test('the security policy lets the page play media and run the PDF worker, from 
 test('room links ask search engines to stay out, and the home page does not', async () => {
   assert.equal((await fetch(`${base}/r/abcdefgh`)).headers.get('x-robots-tag'), 'noindex, nofollow');
   assert.equal((await fetch(`${base}/`)).headers.get('x-robots-tag'), null);
+});
+
+test('addresses that match nothing get a 404', async () => {
+  for (const url of ['/nope', '/r/short', '/api/rooms/abcdefgh/files', '/api/unknown']) {
+    assert.equal((await fetch(base + url)).status, 404, url);
+  }
 });

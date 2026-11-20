@@ -1,95 +1,34 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
 const { after, before, test } = require('node:test');
 const { setTimeout: sleep } = require('node:timers/promises');
-const WebSocket = require('ws');
+const { startRoomShare, clientFor, eventually } = require('./harness.js');
 
-process.env.STORAGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'roomshare-test-'));
-process.env.EMPTY_ROOM_GRACE_MS = '200';
-process.env.MAX_FILE_BYTES = String(1024 * 1024);
-process.env.ROOM_ATTEMPTS_PER_MINUTE = '1000';
-process.env.HEARTBEAT_MS = '600000'; // Keeps the per-heartbeat edit counter from resetting in the middle of a test.
+const EDITS_PER_WINDOW = 50;
+const MAX_TEXT_CHARS = 100_000;
 
-const { server, rooms, storageRoot, config, clientIp } = require('../server.js');
-
+let rs;
 let base;
+let createRoom, joinRoom, openSocket, upgradeStatus, reserve, upload, remove;
 
 before(async () => {
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  base = `http://127.0.0.1:${server.address().port}`;
+  rs = await startRoomShare({
+    vars: {
+      EMPTY_ROOM_GRACE_MS: '200',
+      MAX_FILE_BYTES: String(1024 * 1024),
+      ROOM_ATTEMPTS_PER_MINUTE: '1000',
+      EDITS_PER_WINDOW: String(EDITS_PER_WINDOW),
+      EDIT_WINDOW_MS: '600000', // Keeps the edit counter from resetting in the middle of a test.
+    },
+  });
+  base = rs.base;
+  ({ createRoom, joinRoom, openSocket, upgradeStatus, reserve, upload, remove } = clientFor(base));
 });
 
-after(async () => {
-  server.closeAllConnections();
-  await new Promise((resolve) => server.close(resolve));
-  fs.rmSync(process.env.STORAGE_DIR, { recursive: true, force: true });
-});
+after(() => rs.close());
 
-const cookieFrom = (response) => response.headers.get('set-cookie').split(';')[0];
-
-async function createRoom() {
-  const response = await fetch(`${base}/api/rooms`, { method: 'POST' });
-  assert.equal(response.status, 201);
-  const { id } = await response.json();
-  return { id, cookie: cookieFrom(response) };
-}
-
-async function joinRoom(id) {
-  const response = await fetch(`${base}/api/rooms/${id}/join`, { method: 'POST' });
-  assert.equal(response.status, 200);
-  return cookieFrom(response);
-}
-
-// Queues messages from the moment the socket opens, so nothing arrives before a test is listening.
-function openSocket(id, cookie, headers = {}) {
-  const ws = new WebSocket(`${base.replace('http', 'ws')}/api/rooms/${id}/ws`, { headers: { cookie, ...headers } });
-  const inbox = [];
-  const waiters = [];
-  ws.on('message', (data) => {
-    const message = JSON.parse(data);
-    const waiter = waiters.findIndex((w) => w.type === message.t);
-    if (waiter >= 0) waiters.splice(waiter, 1)[0].resolve(message);
-    else inbox.push(message);
-  });
-  ws.next = (type) => {
-    const queued = inbox.findIndex((m) => m.t === type);
-    if (queued >= 0) return Promise.resolve(inbox.splice(queued, 1)[0]);
-    return new Promise((resolve) => waiters.push({ type, resolve }));
-  };
-  ws.closed = new Promise((resolve) => ws.on('close', resolve));
-  return ws;
-}
-
-function upgradeStatus(id, cookie, headers = {}) {
-  return new Promise((resolve) => {
-    const ws = new WebSocket(`${base.replace('http', 'ws')}/api/rooms/${id}/ws`, { headers: { cookie, ...headers } });
-    ws.on('unexpected-response', (_req, res) => {
-      resolve(res.statusCode);
-      ws.terminate();
-    });
-    ws.on('open', () => {
-      resolve(101);
-      ws.close();
-    });
-    ws.on('error', () => {});
-  });
-}
-
-const upload = (id, cookie, name, body) =>
-  fetch(`${base}/api/rooms/${id}/files?name=${encodeURIComponent(name)}`, {
-    method: 'POST',
-    headers: { cookie },
-    body,
-  });
-
-const roomFiles = (id) => {
-  const dir = path.join(storageRoot, id);
-  return fs.existsSync(dir) ? fs.readdirSync(dir) : null;
-};
+const roomGone = (id) => eventually(async () => !(await rs.room(id)).exists);
 
 test('room IDs are random and unique', async () => {
   const ids = new Set();
@@ -115,7 +54,7 @@ test('people who have not joined cannot reach files or the live room', async () 
   assert.equal(download.status, 403);
   const wrongRoom = await fetch(`${base}/api/rooms/${id}/files/${uploaded.id}`, { headers: { cookie: other.cookie } });
   assert.equal(wrongRoom.status, 403);
-  assert.equal((await upload(id, 'member=' + 'a'.repeat(48), 'x.txt', 'x')).status, 403);
+  assert.equal((await reserve(id, 'member=' + 'a'.repeat(48), 'x.txt', 1)).status, 403);
   assert.equal(await upgradeStatus(id, other.cookie), 403);
   ws.close();
 });
@@ -199,7 +138,7 @@ test('malformed and oversized changes are refused', async () => {
     { id: 'not-text', base: 0, from: 0, to: 0, insert: 42 },
     { id: 'fractional', base: 0, from: 0.5, to: 1, insert: 'x' },
     { id: 'future', base: 7, from: 0, to: 0, insert: 'x' },
-    { id: 'huge', base: 0, from: 0, to: 0, insert: 'x'.repeat(config.maxTextChars + 1) },
+    { id: 'huge', base: 0, from: 0, to: 0, insert: 'x'.repeat(MAX_TEXT_CHARS + 1) },
   ];
   for (const op of bad) {
     edit(alice, op);
@@ -235,12 +174,38 @@ test('the text can be cleared, and the cleared state is what later joiners see',
 test('too many changes in a short time are refused and the sender is told', async () => {
   const { alice, bob } = await joinedPair();
 
-  const limit = config.editsPerHeartbeat;
-  for (let i = 0; i <= limit; i += 1) edit(alice, { id: `e${i}`, base: i, from: i, to: i, insert: 'x' });
+  for (let i = 0; i <= EDITS_PER_WINDOW; i += 1) edit(alice, { id: `e${i}`, base: i, from: i, to: i, insert: 'x' });
 
   assert.equal((await alice.next('notice')).text, 'You are changing the text too quickly.');
-  assert.equal((await alice.next('reject')).id, `e${limit}`);
+  assert.equal((await alice.next('reject')).id, `e${EDITS_PER_WINDOW}`);
   for (const ws of [alice, bob]) ws.close();
+});
+
+test('the shared text and live connections survive the room being unloaded from memory', async () => {
+  const { id, alice, bob, lateJoiner } = await joinedPair();
+  edit(alice, { id: 'a1', base: 0, from: 0, to: 0, insert: 'kept while asleep' });
+  await bob.next('text');
+  await sleep(1300); // The text is saved at most once a second.
+
+  await rs.worker.evictDurableObject('ROOM', { name: id, webSockets: 'hibernate' });
+
+  edit(bob, { id: 'b1', base: 1, from: 0, to: 0, insert: '> ' }); // Wakes the room on the same connection.
+  assert.equal((await alice.next('text')).id, 'a1');
+  assert.equal((await alice.next('text')).id, 'b1');
+  const { ws: carol, init } = await lateJoiner();
+  assert.equal(init.text, '> kept while asleep');
+  assert.equal(init.users, 3);
+  for (const ws of [alice, bob, carol]) ws.close();
+});
+
+test('a "ping" from the page is answered with "pong"', async () => {
+  const { id, cookie } = await createRoom();
+  const ws = openSocket(id, cookie);
+  await ws.next('init');
+  const answer = new Promise((resolve) => ws.on('message', (data) => String(data) === 'pong' && resolve(true)));
+  ws.send('ping');
+  assert.equal(await answer, true);
+  ws.close();
 });
 
 test('a file uploaded by one member downloads intact for another', async () => {
@@ -269,15 +234,32 @@ test('a file uploaded by one member downloads intact for another', async () => {
   bob.close();
 });
 
-test('files over the limit are refused and leave nothing on disk', async () => {
+test('files over the limit are refused before anything is uploaded', async () => {
   const { id, cookie } = await createRoom();
   const ws = openSocket(id, cookie);
   await ws.next('init');
 
-  const response = await upload(id, cookie, 'big.bin', Buffer.alloc(1024 * 1024 + 1));
+  const response = await reserve(id, cookie, 'big.bin', 1024 * 1024 + 1);
   assert.equal(response.status, 413);
-  assert.deepEqual(roomFiles(id), []);
-  assert.equal(rooms.get(id).bytes, 0);
+  assert.deepEqual(await rs.objects(id), []);
+  assert.equal((await rs.room(id)).bytes, 0);
+  ws.close();
+});
+
+test('an upload must match the size it reserved', async () => {
+  const { id, cookie } = await createRoom();
+  const ws = openSocket(id, cookie); // Someone is inside, so the room stays open.
+  await ws.next('init');
+  const slot = await (await reserve(id, cookie, 'a.txt', 10)).json();
+  const wrongSize = await fetch(new URL(slot.url, base), { method: 'PUT', headers: { cookie }, body: 'too short' });
+  assert.equal(wrongSize.status, 400);
+
+  // Even if different bytes reach storage some other way, finishing the upload checks their size.
+  await rs.env.FILES.put(`${id}/${slot.id}`, 'not ten bytes long');
+  const complete = await fetch(`${base}/api/rooms/${id}/uploads/${slot.id}/complete`, { method: 'POST', headers: { cookie } });
+  assert.equal(complete.status, 400);
+  assert.deepEqual(await rs.objects(id), []);
+  assert.equal((await rs.room(id)).bytes, 0);
   ws.close();
 });
 
@@ -288,14 +270,13 @@ test('everything is deleted once the last person leaves', async () => {
   edit(alice, { id: 'a1', base: 0, from: 0, to: 0, insert: 'gone soon' });
   await alice.next('text');
   assert.equal((await upload(id, cookie, 'a.txt', 'data')).status, 201);
-  assert.equal(roomFiles(id).length, 1);
+  assert.equal((await rs.objects(id)).length, 1);
 
   alice.close();
   await alice.closed;
-  await sleep(400);
+  await roomGone(id);
 
-  assert.equal(rooms.has(id), false);
-  assert.equal(roomFiles(id), null);
+  assert.deepEqual(await rs.objects(id), []);
   const rejoin = await fetch(`${base}/api/rooms/${id}/join`, { method: 'POST', headers: { cookie } });
   assert.equal(rejoin.status, 404);
 });
@@ -311,7 +292,7 @@ test('the room survives while one person remains', async () => {
   await bob.closed;
   await sleep(400);
 
-  assert.equal(rooms.has(id), true);
+  assert.equal((await rs.room(id)).exists, true);
   alice.close();
 });
 
@@ -330,30 +311,31 @@ test('reconnecting within the grace period keeps the room', async () => {
   const init = await second.next('init');
   assert.equal(init.text, 'still here');
   await sleep(300);
-  assert.equal(rooms.has(id), true);
+  assert.equal((await rs.room(id)).exists, true);
   second.close();
 });
 
 test('a room nobody ever connects to is cleaned up', async () => {
   const { id } = await createRoom();
-  await sleep(400);
-  assert.equal(rooms.has(id), false);
+  await roomGone(id);
 });
 
-test('a room closing mid-upload stops the upload and removes the partial file', async () => {
+test('a room closing mid-upload discards the file once it arrives', async () => {
   const { id, cookie } = await createRoom();
   const ws = openSocket(id, cookie);
   await ws.next('init');
+  const slot = await (await reserve(id, cookie, 'slow.bin', 2048)).json();
 
   const body = new ReadableStream({
     async start(controller) {
       controller.enqueue(new Uint8Array(1024));
-      await sleep(600);
+      await sleep(800);
+      controller.enqueue(new Uint8Array(1024));
       controller.close();
     },
   });
-  const pending = fetch(`${base}/api/rooms/${id}/files?name=slow.bin`, {
-    method: 'POST',
+  const pending = fetch(new URL(slot.url, base), {
+    method: 'PUT',
     headers: { cookie, 'content-length': '2048' },
     body,
     duplex: 'half',
@@ -362,24 +344,23 @@ test('a room closing mid-upload stops the upload and removes the partial file', 
   await sleep(100);
   ws.close();
   await ws.closed;
-  await sleep(400);
+  await roomGone(id);
 
-  assert.equal(rooms.has(id), false);
-  assert.equal(roomFiles(id), null);
-  await pending;
+  const finished = await pending;
+  assert.notEqual(finished?.status, 200);
+  assert.deepEqual(await rs.objects(id), []);
 });
 
-test('pages and assets are served compressed with long-lived caching', async () => {
-  const page = await fetch(`${base}/r/abcdefgh`, { headers: { 'accept-encoding': 'br' } });
+test('pages carry the security policy, and versioned assets are cached for a long time', async () => {
+  const page = await fetch(`${base}/r/abcdefgh`);
   assert.equal(page.status, 200);
-  assert.equal(page.headers.get('content-encoding'), 'br');
+  assert.ok(page.headers.get('content-security-policy'));
   const html = await page.text();
   const script = html.match(/src="(\/app\.js\?v=[a-f0-9]+)"/)[1];
 
-  const asset = await fetch(base + script, { headers: { 'accept-encoding': 'gzip' } });
-  assert.equal(asset.headers.get('content-encoding'), 'gzip');
+  const asset = await fetch(base + script);
+  assert.equal(asset.status, 200);
   assert.match(asset.headers.get('cache-control'), /immutable/);
-  assert.ok(page.headers.get('content-security-policy'));
 });
 
 test('several tabs from one browser count as one person, and the room needs only one to stay alive', async () => {
@@ -396,32 +377,16 @@ test('several tabs from one browser count as one person, and the room needs only
     await tab.closed;
     assert.equal((await other.next('presence')).users, index < 2 ? 2 : 1, `after closing tab ${index + 1}`);
   }
-  assert.equal(rooms.has(id), true);
+  assert.equal((await rs.room(id)).exists, true);
   other.close();
 });
 
-test('behind proxies, the client address is the one our own proxy added, never one the visitor made up', () => {
-  const request = (forwarded) => ({ headers: { 'x-forwarded-for': forwarded }, socket: { remoteAddress: '10.0.0.9' } });
-  const original = config.trustProxyHops;
-  try {
-    config.trustProxyHops = 0; // No proxy: the header is just a visitor's claim.
-    assert.equal(clientIp(request('6.6.6.6')), '10.0.0.9');
-
-    config.trustProxyHops = 1;
-    assert.equal(clientIp(request('203.0.113.7')), '203.0.113.7');
-    assert.equal(clientIp(request('6.6.6.6, 203.0.113.7')), '203.0.113.7'); // A forged entry comes first.
-    assert.equal(clientIp({ headers: {}, socket: { remoteAddress: '10.0.0.9' } }), '10.0.0.9'); // Header missing.
-
-    config.trustProxyHops = 2; // For example a CDN in front of the host's own proxy.
-    assert.equal(clientIp(request('6.6.6.6, 203.0.113.7, 172.16.0.4')), '203.0.113.7');
-    assert.equal(clientIp(request('172.16.0.4')), '10.0.0.9'); // Shorter than expected, so do not trust it.
-  } finally {
-    config.trustProxyHops = original;
-  }
+test("the client address is Cloudflare's, never one the visitor made up", async () => {
+  const { clientIp } = await import('../src/shared.js');
+  const request = (headers) => new Request('https://roomshare.example/', { headers });
+  assert.equal(clientIp(request({ 'cf-connecting-ip': '203.0.113.7', 'x-forwarded-for': '6.6.6.6' })), '203.0.113.7');
+  assert.equal(clientIp(request({ 'x-forwarded-for': '6.6.6.6' })), 'unknown');
 });
-
-const remove = (id, cookie, fileId = '') =>
-  fetch(`${base}/api/rooms/${id}/files${fileId ? `/${fileId}` : ''}`, { method: 'DELETE', headers: { cookie } });
 
 test('deleting one file removes it for everyone and frees its space', async () => {
   const { id, cookie } = await createRoom();
@@ -433,14 +398,14 @@ test('deleting one file removes it for everyone and frees its space', async () =
 
   const keep = await (await upload(id, cookie, 'keep.txt', 'keep me')).json();
   const drop = await (await upload(id, cookie, 'drop.txt', 'drop me!!')).json();
-  assert.equal(roomFiles(id).length, 2);
+  assert.equal((await rs.objects(id)).length, 2);
 
   assert.equal((await remove(id, bobCookie, drop.id)).status, 200);
 
   assert.equal((await alice.next('fileRemoved')).id, drop.id);
   assert.equal((await bob.next('fileRemoved')).id, drop.id);
-  assert.deepEqual(roomFiles(id), [keep.id]);
-  assert.equal(rooms.get(id).bytes, keep.size);
+  assert.deepEqual(await rs.objects(id), [keep.id]);
+  assert.equal((await rs.room(id)).bytes, keep.size);
   assert.equal((await fetch(`${base}/api/rooms/${id}/files/${drop.id}`, { headers: { cookie } })).status, 404);
   assert.equal((await fetch(`${base}/api/rooms/${id}/files/${keep.id}`, { headers: { cookie } })).status, 200);
   assert.equal((await remove(id, cookie, drop.id)).status, 404);
@@ -463,15 +428,16 @@ test('delete all removes every file and tells everyone who did it', async () => 
   assert.equal((await remove(id, cookie)).status, 200);
 
   assert.equal((await bob.next('filesCleared')).by, you);
-  assert.deepEqual(roomFiles(id), []);
-  assert.equal(rooms.get(id).files.size, 0);
-  assert.equal(rooms.get(id).bytes, 0);
+  assert.deepEqual(await rs.objects(id), []);
+  const room = await rs.room(id);
+  assert.equal(room.files, 0);
+  assert.equal(room.bytes, 0);
 
   alice.close();
   bob.close();
 });
 
-test('deleting a file that is being downloaded stops the download and still removes it', async () => {
+test('a file can be deleted while someone is downloading it', async () => {
   const { id, cookie } = await createRoom();
   const ws = openSocket(id, cookie);
   await ws.next('init');
@@ -479,10 +445,10 @@ test('deleting a file that is being downloaded stops the download and still remo
 
   const response = await fetch(`${base}/api/rooms/${id}/files/${file.id}`, { headers: { cookie } });
   const reader = response.body.getReader();
-  await reader.read(); // The download is under way and holds the file open.
+  await reader.read(); // The download is under way.
 
   assert.equal((await remove(id, cookie, file.id)).status, 200);
-  assert.deepEqual(roomFiles(id), []);
+  assert.deepEqual(await rs.objects(id), []);
   await reader.cancel().catch(() => {});
   ws.close();
 });
@@ -497,7 +463,6 @@ test('people who have not joined cannot delete files', async () => {
   assert.equal((await remove(id, '', file.id)).status, 403);
   assert.equal((await remove(id, stranger.cookie, file.id)).status, 403);
   assert.equal((await remove(id, stranger.cookie)).status, 403);
-  assert.equal(roomFiles(id).length, 1);
+  assert.equal((await rs.objects(id)).length, 1);
   ws.close();
 });
-

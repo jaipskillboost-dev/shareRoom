@@ -1,43 +1,25 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
 const { after, before, test } = require('node:test');
-const { setTimeout: sleep } = require('node:timers/promises');
+const { startRoomShare, clientFor } = require('./harness.js');
 
-for (const name of ['PUBLIC_URL', 'RENDER_EXTERNAL_URL', 'TURNSTILE_SITE_KEY', 'TURNSTILE_SECRET']) delete process.env[name];
-process.env.STORAGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'roomshare-view-'));
-process.env.EMPTY_ROOM_GRACE_MS = '60000';
-process.env.ROOM_ATTEMPTS_PER_MINUTE = '1000';
-
-const { server, storageRoot } = require('../server.js');
-
+let rs;
 let base;
+let client;
 
 before(async () => {
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  base = `http://127.0.0.1:${server.address().port}`;
+  rs = await startRoomShare({ vars: { EMPTY_ROOM_GRACE_MS: '60000', ROOM_ATTEMPTS_PER_MINUTE: '1000' } });
+  base = rs.base;
+  client = clientFor(base);
 });
 
-after(async () => {
-  server.closeAllConnections();
-  await new Promise((resolve) => server.close(resolve));
-  fs.rmSync(process.env.STORAGE_DIR, { recursive: true, force: true });
-});
+after(() => rs.close());
 
-async function newRoom() {
-  const response = await fetch(`${base}/api/rooms`, { method: 'POST' });
-  return { id: (await response.json()).id, cookie: response.headers.get('set-cookie').split(';')[0] };
-}
+const newRoom = () => client.createRoom();
 
 async function addFile(room, name, body) {
-  const response = await fetch(`${base}/api/rooms/${room.id}/files?name=${encodeURIComponent(name)}`, {
-    method: 'POST',
-    headers: { cookie: room.cookie },
-    body,
-  });
+  const response = await client.upload(room.id, room.cookie, name, body);
   assert.equal(response.status, 201);
   return (await response.json()).id;
 }
@@ -229,17 +211,16 @@ test('a deleted file can no longer be viewed, and the view address cannot be use
   assert.equal((await view(room, 'f'.repeat(32))).status, 404, 'an unknown file');
 });
 
-test('deleting a file that is being watched stops the stream and removes the file', async () => {
+test('a file can be deleted while it is being watched', async () => {
   const room = await newRoom();
   const id = await addFile(room, 'long.mp4', Buffer.alloc(1_500_000, 7));
 
   const response = await view(room, id);
   const reader = response.body.getReader();
-  await reader.read(); // Playback is under way, so the file is held open.
+  await reader.read(); // Playback is under way.
 
   const removed = await fetch(`${base}/api/rooms/${room.id}/files/${id}`, { method: 'DELETE', headers: { cookie: room.cookie } });
   assert.equal(removed.status, 200);
-  await sleep(100);
-  assert.deepEqual(fs.readdirSync(path.join(storageRoot, room.id)), []);
+  assert.deepEqual(await rs.objects(room.id), []);
   await reader.cancel().catch(() => {});
 });

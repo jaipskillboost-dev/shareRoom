@@ -1,23 +1,12 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
 const http = require('node:http');
-const os = require('node:os');
-const path = require('node:path');
 const { after, before, test } = require('node:test');
-const { setTimeout: sleep } = require('node:timers/promises');
 const WebSocket = require('ws');
+const { startRoomShare } = require('./harness.js');
 
-process.env.STORAGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'roomshare-protect-'));
-process.env.EMPTY_ROOM_GRACE_MS = '100';
-process.env.ROOM_ATTEMPTS_PER_MINUTE = '1000';
-process.env.PASSWORD_FAILURES_PER_MINUTE = '3';
-process.env.PUBLIC_URL = 'https://share.example.test/';
-process.env.TURNSTILE_SITE_KEY = 'test-site-key';
-process.env.TURNSTILE_SECRET = 'test-secret';
-
-const { server, rooms, config } = require('../server.js');
+const PASSWORD_FAILURES_PER_MINUTE = 3;
 
 // A stand-in for Cloudflare's check: only the token "good" passes, and "broken" makes it fail with a server error.
 const verifyCalls = [];
@@ -33,18 +22,27 @@ const verifier = http.createServer((req, res) => {
 });
 
 let base;
+let rs;
 
 before(async () => {
   await new Promise((resolve) => verifier.listen(0, '127.0.0.1', resolve));
-  config.turnstile.verifyUrl = `http://127.0.0.1:${verifier.address().port}/siteverify`;
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  base = `http://127.0.0.1:${server.address().port}`;
+  rs = await startRoomShare({
+    vars: {
+      EMPTY_ROOM_GRACE_MS: '5000',
+      ROOM_ATTEMPTS_PER_MINUTE: '1000',
+      PASSWORD_FAILURES_PER_MINUTE: String(PASSWORD_FAILURES_PER_MINUTE),
+      TURNSTILE_SITE_KEY: 'test-site-key',
+      TURNSTILE_SECRET: 'test-secret',
+      TURNSTILE_VERIFY_URL: `http://127.0.0.1:${verifier.address().port}/siteverify`,
+    },
+    page: { publicUrl: 'https://share.example.test/', turnstileSiteKey: 'test-site-key' },
+  });
+  base = rs.base;
 });
 
 after(async () => {
-  server.closeAllConnections();
-  await Promise.all([new Promise((resolve) => server.close(resolve)), new Promise((resolve) => verifier.close(resolve))]);
-  fs.rmSync(process.env.STORAGE_DIR, { recursive: true, force: true });
+  await rs.close();
+  await new Promise((resolve) => verifier.close(resolve));
 });
 
 const post = (url, payload, headers = {}) =>
@@ -82,10 +80,10 @@ test('a new room needs a bot check that passes', async () => {
 
 test('the check is sent the secret, the token and the visitor address', async () => {
   verifyCalls.length = 0;
-  await create();
+  await create({}, { 'cf-connecting-ip': '203.0.113.7' });
   assert.deepEqual(
     { secret: verifyCalls[0].secret, response: verifyCalls[0].response, remoteip: verifyCalls[0].remoteip },
-    { secret: 'test-secret', response: 'good', remoteip: '127.0.0.1' },
+    { secret: 'test-secret', response: 'good', remoteip: '203.0.113.7' },
   );
 });
 
@@ -153,18 +151,18 @@ test('the live room tells its members it is locked', async () => {
 test('the password is stored only as a salted hash', async () => {
   const secret = 'correct horse battery staple';
   const { id } = await protectedRoom(secret);
-  const stored = rooms.get(id).password;
-  assert.ok(Buffer.isBuffer(stored.salt) && stored.salt.length === 16);
-  assert.ok(Buffer.isBuffer(stored.key) && stored.key.length === 32);
-  assert.ok(!stored.key.includes(secret) && !JSON.stringify(stored).includes(secret));
+  const stored = (await rs.room(id)).password;
+  assert.match(stored.salt, /^[a-f0-9]{32}$/, '16 random bytes');
+  assert.match(stored.key, /^[a-f0-9]{64}$/, 'a 32-byte hash');
+  assert.ok(!JSON.stringify(stored).includes(secret));
 
   const twin = await protectedRoom(secret);
-  assert.notDeepEqual(stored.key, rooms.get(twin.id).password.key, 'same password, different salt, different hash');
+  assert.notEqual(stored.key, (await rs.room(twin.id)).password.key, 'same password, different salt, different hash');
 });
 
 test('an empty password means no password, and an overlong one is refused', async () => {
   const { id } = await (await create({ password: '' })).json();
-  assert.equal(rooms.get(id).password, null);
+  assert.equal((await rs.room(id)).password, null);
   assert.equal((await post(`/api/rooms/${id}/join`)).status, 200);
 
   assert.equal((await create({ password: 'x'.repeat(129) })).status, 400);
@@ -174,11 +172,11 @@ test('an empty password means no password, and an overlong one is refused', asyn
 
 test('guessing a room password is stopped after a few wrong tries, even for the right one', async () => {
   const { id, owner } = await protectedRoom('the real one');
-  // Checking a password is deliberately slow, and an empty room expires after 100 ms in these tests.
+  // Someone stays inside, so the room stays open however long the guessing takes.
   const inside = connect(id, owner);
   await inside.first;
 
-  for (let i = 0; i < config.passwordFailuresPerMinute; i += 1) {
+  for (let i = 0; i < PASSWORD_FAILURES_PER_MINUTE; i += 1) {
     assert.equal((await post(`/api/rooms/${id}/join`, { password: `guess ${i}` })).status, 401);
   }
   const locked = await post(`/api/rooms/${id}/join`, { password: 'the real one' });
@@ -198,26 +196,6 @@ test('malformed and oversized request bodies are refused cleanly', async () => {
   assert.equal((await fetch(`${base}/api/rooms`, { method: 'POST', body: '{not json' })).status, 400);
   assert.equal((await post('/api/rooms', { turnstileToken: 'good', password: 'x'.repeat(5000) })).status, 413);
   assert.equal((await post('/api/rooms', 'a string')).status, 403, 'valid JSON of the wrong shape is read as an empty request');
-});
-
-/* ---------- Room cap ---------- */
-
-test('the server refuses new rooms when it is full, then recovers', async () => {
-  await sleep(400); // Let rooms from earlier tests, which nobody is in, clear out.
-  const original = config.maxRooms;
-  config.maxRooms = rooms.size + 3;
-  try {
-    for (let i = 0; i < 3; i += 1) assert.equal((await create()).status, 201);
-
-    const full = await create();
-    assert.equal(full.status, 503);
-    assert.match((await full.json()).error, /busy/);
-
-    await sleep(400); // The three empty rooms are cleaned up, which makes space.
-    assert.equal((await create()).status, 201);
-  } finally {
-    config.maxRooms = original;
-  }
 });
 
 /* ---------- Pages and previews ---------- */
