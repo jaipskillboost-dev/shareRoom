@@ -43,16 +43,17 @@ test('new rooms are refused when the site is full, and allowed again once rooms 
   await eventually(async () => (await rs.gate()).rooms === 0);
 });
 
-test('a connection that stops pinging is dropped, and the others are told', async () => {
+test('a connection that stops pinging is dropped, and the others are told it left', async () => {
   const { id, cookie } = await client.createRoom();
   const quiet = client.openSocket(id, cookie);
-  await quiet.next('init');
+  const { you } = await quiet.next('init');
 
   const active = client.openSocket(id, await client.joinRoom(id));
   await active.next('init');
   const pinger = setInterval(() => active.send('ping'), 100);
   try {
     await active.next('presence'); // Two people.
+    assert.equal((await active.next('left')).name, you, 'a phone that lost signal is reported, by name');
     const after = await active.next('presence');
     assert.equal(after.users, 1, 'the silent one is gone');
     await quiet.closed;

@@ -21,6 +21,33 @@ let locked = false; // Whether the room has a password.
 let session = new TextSync.Session();
 let composing = false; // True while an input method (Hindi, Telugu, Chinese...) is building a character.
 let held = []; // Changes from others that arrived mid-composition. Applying them would break the character.
+let me = null; // This person's public ID in the room, from the server.
+let isOwner = false; // Whether this person created the room, which lets them lock it and set a timer.
+let ownerId = null;
+let roomClosed = false; // Locked: nobody new can join.
+let deadline = null; // When the self-destruct timer ends the room, by this device's clock.
+let unseen = 0; // Things that happened while the tab was hidden, shown in the tab title.
+const people = new Map(); // Public ID -> name, for everyone connected now.
+const typingNow = new Map(); // Public ID -> when they last typed.
+const othersUploading = new Map(); // "pid:key" -> the row showing someone else's upload.
+
+const store = {
+  get(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch {}
+  },
+};
+const savedName = () => Device.cleanName(store.get('roomshare-name'));
+const myName = () => savedName() ?? Device.deviceName(navigator.userAgent, navigator.maxTouchPoints);
+let soundOn = store.get('roomshare-sound') !== 'off';
 
 const stackedLayout = window.matchMedia('(max-width: 859px)'); // One section at a time, chosen with the tabs.
 
@@ -94,6 +121,7 @@ function syncStates() {
   const fileCount = filesList.children.length;
   $('no-files').hidden = fileCount > 0 || uploads.children.length > 0;
   $('delete-all-files').hidden = fileCount === 0;
+  $('download-all').hidden = fileCount < 2;
   $('files-count').hidden = fileCount === 0;
   $('files-count').textContent = fileCount;
   $('copy-text').disabled = $('clear-text').disabled = box.value.length === 0;
@@ -116,6 +144,16 @@ function showHome(error) {
   online = 0;
   locked = false;
   $('lock-badge').hidden = true;
+  me = null;
+  isOwner = false;
+  ownerId = null;
+  people.clear();
+  typingNow.clear();
+  othersUploading.clear();
+  renderActivity();
+  setClosed(false);
+  setDeadline(null);
+  unseen = 0;
   $('join-password-row').hidden = true;
   $('join-password').value = '';
   box.value = '';
@@ -134,7 +172,7 @@ function showRoom(id) {
   home.hidden = true;
   roomView.hidden = false;
   $('room-code').textContent = id;
-  document.title = `Room ${id} · RoomShare`;
+  updateTitle();
   if (location.pathname !== `/r/${id}`) history.pushState(null, '', `/r/${id}`);
 }
 
@@ -203,7 +241,8 @@ function closeSocket() {
 function connect() {
   closeSocket();
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${protocol}://${location.host}/api/rooms/${roomId}/ws`);
+  // The name goes with the connection, so the others' "joined" notice already shows it.
+  const ws = new WebSocket(`${protocol}://${location.host}/api/rooms/${roomId}/ws?name=${encodeURIComponent(myName())}`);
   socket = ws;
 
   ws.onmessage = (event) => {
@@ -214,11 +253,11 @@ function connect() {
   };
 }
 
-// Tells the server this tab is still here. A phone that loses signal stops sending these, and the server notices.
-// Cloudflare answers them without waking the room, so they cost nothing.
+// Tells the server this tab is still here. A phone that loses signal or is locked stops sending these, and the
+// others are told it left within about 15 seconds. Cloudflare answers them without waking the room.
 setInterval(() => {
   if (socket?.readyState === WebSocket.OPEN) socket.send('ping');
-}, 15_000);
+}, 5_000);
 
 function scheduleReconnect(delay = Math.min(500 * 2 ** reconnectAttempts, 5000)) {
   clearTimeout(reconnectTimer);
@@ -244,8 +283,168 @@ async function rejoin() {
 function setPresence(users) {
   online = users;
   $('presence-text').textContent = `${users} online`;
+  presence.title = [...people.values()].join(', ');
   presence.classList.remove('offline');
 }
+
+function sendAction(message) {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+}
+
+const nameOf = (pid) => (pid === me ? 'You' : people.get(pid) ?? 'Someone');
+
+function setPeople(list = []) {
+  people.clear();
+  for (const { pid, name } of list) people.set(pid, name);
+  presence.title = [...people.values()].join(', ');
+  if ($('room-menu').open) renderPeople();
+}
+
+/* ---------- Tab title, sound ---------- */
+
+function updateTitle() {
+  const base = roomId ? `Room ${roomId} · RoomShare` : 'RoomShare';
+  document.title = unseen ? `(${unseen}) ${base}` : base;
+}
+
+// Counts what happens while the tab is in the background, so the tab title shows there is something new.
+function noteUnseen() {
+  if (!document.hidden) return;
+  unseen += 1;
+  updateTitle();
+}
+
+let audio = null;
+// Browsers only allow sound after the person has touched the page, so the audio is set up on the first touch.
+addEventListener('pointerdown', () => {
+  try {
+    audio ??= new AudioContext();
+  } catch {}
+}, { once: true });
+
+function chime() {
+  try {
+    if (!audio) return;
+    if (audio.state === 'suspended') audio.resume();
+    const start = audio.currentTime;
+    [880, 1318.5].forEach((frequency, index) => {
+      const tone = audio.createOscillator();
+      const volume = audio.createGain();
+      const at = start + index * 0.12;
+      tone.type = 'sine';
+      tone.frequency.value = frequency;
+      volume.gain.setValueAtTime(0.0001, at);
+      volume.gain.exponentialRampToValueAtTime(0.12, at + 0.02);
+      volume.gain.exponentialRampToValueAtTime(0.0001, at + 0.35);
+      tone.connect(volume).connect(audio.destination);
+      tone.start(at);
+      tone.stop(at + 0.4);
+    });
+  } catch {}
+}
+
+function announceArrival() {
+  noteUnseen();
+  if (!soundOn) return;
+  chime();
+  navigator.vibrate?.(80);
+}
+
+/* ---------- Who is doing what ---------- */
+
+function renderActivity() {
+  const now = Date.now();
+  const typing = [...typingNow].filter(([pid, at]) => pid !== me && now - at < 3500).map(([pid]) => nameOf(pid));
+  $('activity').textContent =
+    typing.length === 0 ? '' : typing.length === 1 ? `${typing[0]} is typing…` : `${typing.length} people are typing…`;
+}
+setInterval(renderActivity, 1000);
+
+let lastTypingSent = 0;
+function noteTyping() {
+  if (Date.now() - lastTypingSent < 1500) return;
+  lastTypingSent = Date.now();
+  sendAction({ t: 'typing' });
+}
+
+// Someone else's upload shows as a row with their name and progress, until it finishes or they leave.
+function showOthersUpload(data) {
+  const id = `${data.pid}:${data.key}`;
+  let entry = othersUploading.get(id);
+  if (data.done) {
+    entry?.row.remove();
+    othersUploading.delete(id);
+    syncStates();
+    return;
+  }
+  if (!entry) {
+    const row = element('li', 'file remote');
+    const info = element('div', 'file-info');
+    const bar = element('progress', 'upload-bar');
+    bar.max = 1;
+    const meta = element('div', 'file-meta');
+    info.append(fileName(data.file), bar, meta);
+    row.append(fileBadge(data.file), info);
+    uploads.append(row);
+    entry = { row, bar, meta, pid: data.pid };
+    othersUploading.set(id, entry);
+  }
+  entry.bar.value = data.pct / 100;
+  entry.meta.textContent = `${nameOf(data.pid)} is sending this · ${data.pct}%`;
+  entry.seen = Date.now();
+  syncStates();
+}
+
+function dropOthersUploads(pid) {
+  for (const [id, entry] of othersUploading) {
+    if (pid && entry.pid !== pid) continue;
+    entry.row.remove();
+    othersUploading.delete(id);
+  }
+  syncStates();
+}
+
+// A connection that drops mid-upload never says "done", so rows that stop moving are removed.
+setInterval(() => {
+  for (const [id, entry] of othersUploading) {
+    if (Date.now() - entry.seen > 20_000) {
+      entry.row.remove();
+      othersUploading.delete(id);
+    }
+  }
+  syncStates();
+}, 5000);
+
+/* ---------- Lock and timer ---------- */
+
+function setClosed(closed) {
+  roomClosed = closed;
+  $('closed-badge').hidden = !closed;
+  $('lock-toggle').setAttribute('aria-checked', closed);
+}
+
+let deadlineTicker = null;
+function setDeadline(msLeft) {
+  clearInterval(deadlineTicker);
+  deadline = msLeft == null ? null : Date.now() + msLeft;
+  $('timer-badge').hidden = deadline === null;
+  if (deadline !== null) {
+    const tick = () => {
+      const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+      const h = Math.floor(left / 3600);
+      const m = Math.floor((left % 3600) / 60);
+      const sec = String(left % 60).padStart(2, '0');
+      $('timer-text').textContent = `Deletes in ${h ? `${h}:${String(m).padStart(2, '0')}` : m}:${sec}`;
+    };
+    tick();
+    deadlineTicker = setInterval(tick, 1000);
+  }
+  for (const button of document.querySelectorAll('#timer-options button')) {
+    button.setAttribute('aria-pressed', deadline === null ? button.dataset.seconds === '0' : 'false');
+  }
+}
+
+const describeTimer = (ms) => (ms >= 3_600_000 ? `${Math.round(ms / 3_600_000)} hour` : `${Math.round(ms / 60_000)} minutes`);
 
 /* ---------- Shared text ---------- */
 
@@ -281,6 +480,7 @@ function applyResult({ value, send }) {
 function typed() {
   applyResult({ value: null, send: session.edit(box.value) });
   syncStates();
+  noteTyping();
 }
 
 box.addEventListener('compositionstart', () => {
@@ -303,6 +503,13 @@ function handleMessage(data) {
   switch (data.t) {
     case 'init':
       reconnectAttempts = 0;
+      me = data.me ?? null;
+      isOwner = data.owner === true;
+      ownerId = data.ownerId ?? null;
+      setPeople(data.people);
+      setClosed(data.closed === true);
+      setDeadline(data.expiresIn ?? null);
+      dropOthersUploads();
       maxFileBytes = data.maxFileBytes;
       box.maxLength = data.maxTextChars;
       locked = data.locked;
@@ -315,11 +522,54 @@ function handleMessage(data) {
       syncStates();
       break;
     case 'presence':
+      if (data.people) setPeople(data.people);
       setPresence(data.users);
+      break;
+    case 'joined':
+      people.set(data.pid, data.name);
+      if (data.pid !== me) {
+        toast(`${data.name} joined`, { long: true });
+        noteUnseen();
+      }
+      break;
+    case 'left':
+      toast(`${data.name} left`, { long: true });
+      typingNow.delete(data.pid);
+      renderActivity();
+      dropOthersUploads(data.pid);
+      break;
+    case 'renamed':
+      people.set(data.pid, data.name);
+      refreshFileSenders();
+      renderActivity();
+      if ($('room-menu').open) renderPeople();
+      break;
+    case 'typing':
+      typingNow.set(data.pid, Date.now());
+      renderActivity();
+      break;
+    case 'uploading':
+      showOthersUpload(data);
+      break;
+    case 'closed':
+      setClosed(data.closed === true);
+      if (data.byId !== me) toast(data.closed ? `${data.by} locked the room. Nobody new can join.` : `${data.by} unlocked the room.`);
+      break;
+    case 'timer':
+      setDeadline(data.expiresIn ?? null);
+      if (data.byId !== me) {
+        toast(data.expiresIn ? `${data.by} set the room to delete itself in ${describeTimer(data.expiresIn)}.` : `${data.by} turned off the room's timer.`);
+      }
+      break;
+    case 'ended':
+      clearTimeout(reconnectTimer);
+      closeSocket();
+      showHome("The room's timer ran out, so the room, its text and its files were deleted.");
       break;
     case 'text':
       if (composing) held.push(data);
       else applyResult(session.receive(data));
+      noteUnseen(); // Only counts while the tab is hidden, when it cannot be this person's own typing.
       break;
     case 'reject':
       if (composing) {
@@ -331,6 +581,7 @@ function handleMessage(data) {
       break;
     case 'file':
       addFile(data.file);
+      if (data.file.fromId !== me) announceArrival();
       syncStates();
       updateViewerBar();
       // On a phone the Files tab may be out of sight, so say that something arrived.
@@ -392,14 +643,21 @@ function fileName(name, onOpen) {
   return node;
 }
 
+// "211 KB · 05:32 PM · from iPhone". A sender who has since changed their name shows the new one.
+function fileMeta(file) {
+  const sender = !file.fromId ? file.from : file.fromId === me ? 'you' : people.get(file.fromId) ?? file.from;
+  return [formatSize(Number(file.size)), formatTime(Number(file.at)), sender && `from ${sender}`].filter(Boolean).join(' · ');
+}
+
+function refreshFileSenders() {
+  for (const row of filesList.children) row.querySelector('.file-meta').textContent = fileMeta(row.dataset);
+}
+
 function addFile(file) {
   const viewable = FileTypes.isViewable(file.name);
   const row = element('li', 'file');
   const info = element('div', 'file-info');
-  info.append(
-    fileName(file.name, viewable ? () => openViewer(file.id) : undefined),
-    element('div', 'file-meta', `${formatSize(file.size)} · ${formatTime(file.at)}`),
-  );
+  info.append(fileName(file.name, viewable ? () => openViewer(file.id) : undefined), element('div', 'file-meta', fileMeta(file)));
 
   const link = element('a', 'icon-btn');
   link.href = `/api/rooms/${roomId}/files/${file.id}`;
@@ -426,7 +684,7 @@ function addFile(file) {
     actions.append(open);
   }
   actions.append(link, remove);
-  Object.assign(row.dataset, { id: file.id, name: file.name, size: file.size, viewable });
+  Object.assign(row.dataset, { id: file.id, name: file.name, size: file.size, viewable, at: file.at, from: file.from ?? '', fromId: file.fromId ?? '' });
   row.append(fileBadge(file.name), info, actions);
   filesList.prepend(row);
 }
@@ -469,6 +727,16 @@ function uploadFile(file) {
   const offline = 'Upload failed. Check your connection and try again.';
   const errorOf = async (response) => (await response.json().catch(() => ({}))).error ?? 'Upload failed.';
 
+  // The others see this upload, with its progress, while it happens.
+  const key = Math.random().toString(36).slice(2, 10);
+  let lastShared = 0;
+  const share = (pct) => {
+    if (Date.now() - lastShared < 700 && pct < 100) return;
+    lastShared = Date.now();
+    sendAction({ t: 'uploading', key, file: file.name, size: file.size, pct });
+  };
+  share(0);
+
   // Three steps: reserve space and get an upload link, send the file to that link, then tell the room it arrived.
   // The link usually goes straight to file storage, so large files never pass through the server.
   return (async () => {
@@ -492,6 +760,7 @@ function uploadFile(file) {
         if (!event.lengthComputable) return;
         bar.value = event.loaded / event.total;
         status.textContent = `${formatSize(event.loaded)} of ${formatSize(event.total)}`;
+        share(Math.round((event.loaded / event.total) * 100));
       };
       xhr.onload = () => resolve(xhr.status >= 200 && xhr.status < 300);
       xhr.onerror = () => resolve(false);
@@ -507,7 +776,7 @@ function uploadFile(file) {
     }
     row.remove();
     syncStates();
-  })();
+  })().finally(() => sendAction({ t: 'uploading', key, done: true }));
 }
 
 async function uploadAll(files) {
@@ -976,15 +1245,22 @@ $('join-form').addEventListener('submit', async (event) => {
 });
 
 $('leave-room').addEventListener('click', async () => {
-  // Leaving as the last person ends the room, so that gets a second look.
-  if (online <= 1) {
-    const leave = await confirmDialog({
-      title: 'Leave this room?',
-      body: 'You are the only one here. Leaving deletes all files and text in this room for good.',
-      action: 'Leave and delete',
-    });
-    if (!leave) return;
-  }
+  // Every device asks first, so a stray tap never drops anyone out. Leaving as the last person also ends the room.
+  const last = online <= 1;
+  const leave = await confirmDialog(
+    last
+      ? {
+          title: 'Leave this room?',
+          body: 'You are the only one here. Leaving deletes all files and text in this room for good.',
+          action: 'Leave and delete',
+        }
+      : {
+          title: 'Leave this room?',
+          body: 'The room stays open for the others. You can come back with the room code while someone is still in it.',
+          action: 'Leave',
+        },
+  );
+  if (!leave) return;
   clearTimeout(reconnectTimer);
   closeSocket();
   showHome();
@@ -1146,6 +1422,10 @@ window.addEventListener('drop', (event) => {
 
 // Phones suspend sockets in the background, so reconnect the moment the page returns.
 document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && unseen) {
+    unseen = 0;
+    updateTitle();
+  }
   // A socket that is still connecting is left alone, or it would be replaced mid-handshake.
   if (document.visibilityState === 'visible' && roomId && (!socket || socket.readyState >= WebSocket.CLOSING)) {
     scheduleReconnect(0);
@@ -1178,6 +1458,229 @@ $('install-app').addEventListener('click', async () => {
   installPrompt = null;
   $('install-app').hidden = true;
 });
+
+/* ---------- Room options: people, name, sound, lock, timer ---------- */
+
+function renderPeople() {
+  const list = $('people-list');
+  list.replaceChildren(
+    ...[...people].map(([pid, name]) => {
+      const row = element('li');
+      const tags = [pid === me && 'you', pid === ownerId && 'created the room'].filter(Boolean).join(', ');
+      row.append(element('span', '', name));
+      if (tags) row.append(element('span', 'tag', tags));
+      return row;
+    }),
+  );
+}
+
+$('room-options').addEventListener('click', () => {
+  renderPeople();
+  $('name-input').value = people.get(me) ?? myName();
+  $('sound-toggle').setAttribute('aria-checked', soundOn);
+  $('lock-toggle').disabled = !isOwner;
+  for (const button of document.querySelectorAll('#timer-options button')) button.disabled = !isOwner;
+  $('owner-hint').hidden = isOwner;
+  $('room-menu').showModal();
+});
+$('room-menu-close').addEventListener('click', () => $('room-menu').close());
+$('room-menu').addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) event.currentTarget.close();
+});
+
+$('name-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const name = Device.cleanName($('name-input').value);
+  if (!name) return toast('Enter a name, or close this to keep the one you have.', { error: true });
+  store.set('roomshare-name', name);
+  people.set(me, name);
+  sendAction({ t: 'name', name });
+  renderPeople();
+  toast('Name saved');
+});
+
+$('sound-toggle').addEventListener('click', () => {
+  soundOn = !soundOn;
+  store.set('roomshare-sound', soundOn ? 'on' : 'off');
+  $('sound-toggle').setAttribute('aria-checked', soundOn);
+  if (soundOn) chime();
+});
+
+$('lock-toggle').addEventListener('click', () => {
+  if (!isOwner) return;
+  sendAction({ t: 'lock', closed: !roomClosed });
+  toast(roomClosed ? 'Room unlocked' : 'Room locked. Nobody new can join.');
+});
+
+for (const button of document.querySelectorAll('#timer-options button')) {
+  button.addEventListener('click', () => {
+    if (!isOwner) return;
+    const seconds = Number(button.dataset.seconds);
+    sendAction({ t: 'timer', seconds });
+    toast(seconds ? `The room will delete itself in ${describeTimer(seconds * 1000)}.` : 'Timer off');
+  });
+}
+
+/* ---------- Download all, as one zip made in the browser ---------- */
+
+const ZIP_LIMIT = 500 * 1024 * 1024; // The zip is built in memory, which phones in particular cannot spare much of.
+let zipLibrary = null;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = src;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error(`Could not load ${src}`));
+    document.head.append(script);
+  });
+}
+
+function uniqueName(name, used) {
+  let candidate = name;
+  for (let n = 2; used.has(candidate.toLowerCase()); n += 1) {
+    const dot = name.lastIndexOf('.');
+    candidate = dot > 0 ? `${name.slice(0, dot)} (${n})${name.slice(dot)}` : `${name} (${n})`;
+  }
+  used.add(candidate.toLowerCase());
+  return candidate;
+}
+
+$('download-all').addEventListener('click', async () => {
+  const rows = [...filesList.children].reverse(); // Oldest first, the order they were shared in.
+  const total = rows.reduce((sum, row) => sum + Number(row.dataset.size), 0);
+  if (total > ZIP_LIMIT) {
+    return toast(`That is ${formatSize(total)}, too much to zip in a browser. Download the files one at a time.`, { error: true, long: true });
+  }
+  const button = $('download-all');
+  const label = button.querySelector('.btn-label');
+  button.disabled = true;
+  try {
+    zipLibrary ??= loadScript('/vendor/fflate.js').then(() => window.fflate);
+    const { Zip, ZipPassThrough } = await zipLibrary;
+    const parts = [];
+    let zip;
+    const finished = new Promise((resolve, reject) => {
+      zip = new Zip((error, chunk, final) => {
+        if (error) return reject(error);
+        parts.push(chunk);
+        if (final) resolve();
+      });
+    });
+    const used = new Set();
+    let done = 0;
+    for (const row of rows) {
+      const entry = new ZipPassThrough(uniqueName(row.dataset.name, used)); // Stored as is: most files are already compressed.
+      zip.add(entry);
+      const response = await fetch(downloadUrl(row.dataset.id));
+      if (!response.ok) throw new Error('download failed');
+      const reader = response.body.getReader();
+      for (;;) {
+        const { done: end, value } = await reader.read();
+        if (end) break;
+        entry.push(value);
+        done += value.length;
+        label.textContent = `Zipping ${Math.round((done / Math.max(total, 1)) * 100)}%`;
+      }
+      entry.push(new Uint8Array(0), true);
+    }
+    zip.end();
+    await finished;
+    const url = URL.createObjectURL(new Blob(parts, { type: 'application/zip' }));
+    const link = element('a');
+    link.href = url;
+    link.download = `roomshare-${roomId}.zip`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  } catch {
+    toast('Could not make the zip. Try again, or download the files one at a time.', { error: true });
+  } finally {
+    label.textContent = 'Download all';
+    button.disabled = false;
+  }
+});
+
+/* ---------- Scan a QR code to join ---------- */
+
+const scanner = { stream: null, timer: null, reader: null };
+let jsQrLibrary = null;
+
+function showScanError(text) {
+  $('scan-error').textContent = text;
+  $('scan-error').hidden = false;
+}
+
+function stopScanner() {
+  clearTimeout(scanner.timer);
+  scanner.stream?.getTracks().forEach((track) => track.stop());
+  scanner.stream = null;
+  $('scan-video').srcObject = null;
+}
+
+// The browser's own QR reader where it has one (most phones), otherwise jsQR, loaded only now.
+async function qrReader() {
+  if ('BarcodeDetector' in window) {
+    try {
+      if ((await BarcodeDetector.getSupportedFormats()).includes('qr_code')) {
+        const detector = new BarcodeDetector({ formats: ['qr_code'] });
+        return async (video) => (await detector.detect(video))[0]?.rawValue ?? null;
+      }
+    } catch {}
+  }
+  jsQrLibrary ??= loadScript('/vendor/jsQR.js').then(() => window.jsQR);
+  const jsQR = await jsQrLibrary;
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  return async (video) => {
+    const scale = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return jsQR(context.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height)?.data ?? null;
+  };
+}
+
+$('scan-qr').hidden = !navigator.mediaDevices?.getUserMedia; // Cameras only work on secure (https) pages.
+
+$('scan-qr').addEventListener('click', async () => {
+  $('scan-error').hidden = true;
+  $('scan').showModal();
+  try {
+    scanner.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+  } catch {
+    return showScanError('The camera is blocked. Allow it for this site, or type the room ID instead.');
+  }
+  const video = $('scan-video');
+  video.srcObject = scanner.stream;
+  await video.play().catch(() => {});
+  let read;
+  try {
+    read = await qrReader();
+  } catch {
+    return showScanError('The QR reader could not load. Type the room ID instead.');
+  }
+  const look = async () => {
+    if (!scanner.stream) return;
+    let text = null;
+    try {
+      if (video.readyState >= 2) text = await read(video);
+    } catch {}
+    const id = text && parseRoomInput(text);
+    if (id) {
+      $('scan').close();
+      $('room-input').value = id;
+      $('join-form').requestSubmit();
+      return;
+    }
+    if (text) showScanError('That QR code is not a RoomShare room. Try the code on the screen that shows the room.');
+    scanner.timer = setTimeout(look, text ? 1200 : 150);
+  };
+  look();
+});
+$('scan-close').addEventListener('click', () => $('scan').close());
+$('scan').addEventListener('close', stopScanner);
 
 loadChallenge();
 

@@ -13,7 +13,7 @@ import { contentSecurityPolicy, r2Origin, renderPage } from '../src/shared.js';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // Files whose address carries ?v=<version>, so browsers can keep them forever.
-const VERSIONED = ['app.js', 'textsync.js', 'theme.js', 'qr.js', 'filetypes.js', 'vendor/qrcode.js', 'style.css'];
+const VERSIONED = ['app.js', 'textsync.js', 'theme.js', 'qr.js', 'filetypes.js', 'device.js', 'vendor/qrcode.js', 'style.css'];
 const DAILY = ['manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png', 'og-image.png'];
 
 export function buildAssets({ outDir = path.join(root, 'dist'), publicUrl = '', turnstileSiteKey = '', turnstileSecretSet = true, r2AccountId = '', directUploads = Boolean(r2AccountId) } = {}) {
@@ -38,8 +38,8 @@ export function buildAssets({ outDir = path.join(root, 'dist'), publicUrl = '', 
       rule(['', 'index.html'], 'no-cache'),
       rule(VERSIONED, 'public, max-age=31536000, immutable'),
       rule(DAILY, 'public, max-age=86400'),
-      // The PDF reader is loaded only when someone opens a PDF. Its address carries no version, so it is cached for a week.
-      rule(['vendor/pdfjs/pdf.min.mjs', 'vendor/pdfjs/pdf.worker.min.mjs'], 'public, max-age=604800'),
+      // Loaded only when needed (a PDF, Download all, a QR scan). Their addresses carry no version, so a week.
+      rule(['vendor/pdfjs/pdf.min.mjs', 'vendor/pdfjs/pdf.worker.min.mjs', 'vendor/fflate.js', 'vendor/jsQR.js'], 'public, max-age=604800'),
     ].join(''),
   );
   return { outDir, version, policy };

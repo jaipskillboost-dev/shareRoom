@@ -34,6 +34,7 @@
   <script src="/vendor/qrcode.js?v=__VERSION__" defer></script>
   <script src="/qr.js?v=__VERSION__" defer></script>
   <script src="/filetypes.js?v=__VERSION__" defer></script>
+  <script src="/device.js?v=__VERSION__" defer></script>
   <script src="/app.js?v=__VERSION__" defer></script>
 </head>
 <body>
@@ -65,6 +66,10 @@
     <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></symbol>
     <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
     <symbol id="i-download-app" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="3"/><path d="M12 7v7M9 11l3 3 3-3M10 18h4"/></symbol>
+    <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+    <symbol id="i-zip" viewBox="0 0 24 24"><path d="M21 8v13H3V3h12z"/><path d="M15 3v5h6M10 6h1M10 9h1M10 12h1M9 15h3v3H9z"/></symbol>
   </svg>
 
   <main id="home" class="home">
@@ -115,6 +120,11 @@
           </div>
         </form>
 
+        <button id="scan-qr" class="link-btn scan-link" type="button" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg>
+          <span>Scan a room's QR code</span>
+        </button>
+
         <p id="home-error" class="form-error" role="alert" hidden></p>
       </div>
 
@@ -152,12 +162,23 @@
           <span class="dot" aria-hidden="true"></span>
           <span id="presence-text"></span>
         </p>
+        <span id="closed-badge" class="status-badge" title="Nobody new can join this room" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>
+          <span>Locked</span>
+        </span>
+        <span id="timer-badge" class="status-badge warn" title="This room deletes itself when the timer runs out" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#i-timer"/></svg>
+          <span id="timer-text"></span>
+        </span>
       </div>
 
       <div class="topbar-actions">
         <button id="share-room" class="btn primary sm" type="button" title="Invite people with a link or QR code">
           <svg class="icon" aria-hidden="true"><use href="#i-share"/></svg>
           <span>Share</span>
+        </button>
+        <button id="room-options" class="icon-btn" type="button" aria-label="Room options" title="People, your name, sound, lock and timer">
+          <svg class="icon" aria-hidden="true"><use href="#i-more"/></svg>
         </button>
         <button class="icon-btn" type="button" data-theme-toggle>
           <svg class="icon i-moon" aria-hidden="true"><use href="#i-moon"/></svg>
@@ -197,10 +218,16 @@
               <p class="panel-sub">Shared with everyone in the room</p>
             </div>
           </div>
-          <button id="delete-all-files" class="btn sm danger" type="button" hidden>
-            <svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>
-            <span class="btn-label">Delete all</span>
-          </button>
+          <div class="panel-actions">
+            <button id="download-all" class="btn sm" type="button" hidden>
+              <svg class="icon" aria-hidden="true"><use href="#i-zip"/></svg>
+              <span class="btn-label">Download all</span>
+            </button>
+            <button id="delete-all-files" class="btn sm danger" type="button" hidden>
+              <svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>
+              <span class="btn-label">Delete all</span>
+            </button>
+          </div>
         </div>
 
         <label id="dropzone" class="dropzone" for="file-input">
@@ -245,7 +272,10 @@
 
         <textarea id="shared-text" class="field shared-text" aria-label="Shared message" spellcheck="false"
                   autocomplete="off" placeholder="Type or paste here. Everyone in the room sees it instantly."></textarea>
-        <p id="char-count" class="char-count"></p>
+        <div class="text-foot">
+          <p id="activity" class="activity" aria-live="polite"></p>
+          <p id="char-count" class="char-count"></p>
+        </div>
       </section>
     </div>
   </div>
@@ -309,6 +339,74 @@
         <button id="invite-native" class="btn" type="button" hidden>Share…</button>
         <button id="invite-copy" class="btn primary" type="button">Copy link</button>
         <button id="invite-close" class="btn" type="button">Done</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="room-menu" class="modal" aria-labelledby="room-menu-title">
+    <div class="modal-card menu-card">
+      <h2 id="room-menu-title">Room options</h2>
+
+      <section class="menu-section">
+        <h3><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg> In this room</h3>
+        <ul id="people-list" class="people"></ul>
+      </section>
+
+      <section class="menu-section">
+        <h3><label for="name-input">Your name</label></h3>
+        <form id="name-form" class="name-row">
+          <input id="name-input" class="field" type="text" maxlength="40" autocomplete="off" enterkeyhint="done">
+          <button class="btn" type="submit">Save</button>
+        </form>
+        <p class="field-hint">Others see it when you join, type or send a file. It is remembered on this device.</p>
+      </section>
+
+      <section class="menu-section toggle-row">
+        <div>
+          <h3 id="sound-label">Sound for new files</h3>
+          <p class="field-hint">A short chime, and a buzz on phones, when someone else sends a file.</p>
+        </div>
+        <button id="sound-toggle" class="switch" type="button" role="switch" aria-checked="true" aria-labelledby="sound-label"></button>
+      </section>
+
+      <section class="menu-section toggle-row">
+        <div>
+          <h3 id="lock-label">Lock the room</h3>
+          <p class="field-hint">Nobody new can join, even with the code. People already here can still come back.</p>
+        </div>
+        <button id="lock-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="lock-label"></button>
+      </section>
+
+      <section class="menu-section">
+        <h3 id="timer-label">Delete the room after</h3>
+        <div id="timer-options" class="segmented" role="group" aria-labelledby="timer-label">
+          <button type="button" data-seconds="0">Off</button>
+          <button type="button" data-seconds="600">10 min</button>
+          <button type="button" data-seconds="1800">30 min</button>
+          <button type="button" data-seconds="3600">1 hour</button>
+        </div>
+        <p class="field-hint">Even if people are still in it. It always ends when the last person leaves.</p>
+      </section>
+
+      <p id="owner-hint" class="owner-hint" hidden>Only the person who created the room can lock it or set a timer.</p>
+
+      <div class="modal-actions">
+        <button id="room-menu-close" class="btn primary" type="button">Done</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="scan" class="modal" aria-labelledby="scan-title">
+    <div class="modal-card scan-card">
+      <h2 id="scan-title">Scan a room's QR code</h2>
+      <p>Point the camera at the QR code on the other screen.</p>
+      <div class="scan-view">
+        <video id="scan-video" playsinline muted></video>
+        <span class="scan-frame" aria-hidden="true"></span>
+      </div>
+      <p id="scan-error" class="form-error" role="alert" hidden></p>
+      <div class="modal-actions">
+        <button id="scan-close" class="btn" type="button">Cancel</button>
       </div>
     </div>
   </dialog>

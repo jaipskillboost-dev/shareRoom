@@ -30,9 +30,15 @@ export function limits(env = {}) {
     // so typing stays far below it.
     editsPerWindow: read('EDITS_PER_WINDOW', 400),
     editWindowMs: read('EDIT_WINDOW_MS', 10_000),
-    // The page sends "ping" every 15 seconds. A connection silent for longer than this is treated as gone.
-    staleSocketMs: read('STALE_SOCKET_MS', 45_000),
-    presenceCheckMs: read('PRESENCE_CHECK_MS', 30_000),
+    // Other live messages (typing, upload progress, names, settings) per connection per window. Pages send far fewer.
+    actionsPerWindow: read('ACTIONS_PER_WINDOW', 60),
+    // The longest self-destruct timer a room can have.
+    maxTimerSeconds: read('MAX_TIMER_SECONDS', 24 * 60 * 60),
+    // The page sends "ping" every 5 seconds. A connection silent for longer than this is treated as gone, so a phone
+    // that loses signal or is locked is reported as having left within about 15 seconds. The check runs while
+    // anyone is connected; each run is one Durable Object request, about 600 an hour per open room.
+    staleSocketMs: read('STALE_SOCKET_MS', 12_000),
+    presenceCheckMs: read('PRESENCE_CHECK_MS', 6_000),
     // How long an upload link stays reserved before its space is given back.
     uploadSlotMs: read('UPLOAD_SLOT_MS', 30 * 60_000),
   };

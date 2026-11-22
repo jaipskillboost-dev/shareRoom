@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
+import Device from '../public/device.js';
 import TextSync from '../public/textsync.js';
 import { MAX_PASSWORD_CHARS, cleanFileName, isEdit, limits, memberToken } from './shared.js';
 
@@ -23,8 +24,11 @@ async function passwordMatches(stored, text) {
  *
  * Connections use the WebSocket Hibernation API, so a quiet room is unloaded from memory without dropping anyone,
  * and wakes when someone types. Everything needed after waking is in storage:
- *   meta            { id, password, createdAt }. Missing means the room does not exist (or has ended).
- *   m:<token>       a member's display name
+ *   meta            { id, password, createdAt, owner, closed, expiresAt }. Missing means the room does not exist.
+ *                   owner is the creator's member token; closed means locked to newcomers; expiresAt is the
+ *                   self-destruct time, if one is set.
+ *   m:<token>       a member: { name, pid }. The pid is a short public ID, so pages can tell people apart
+ *                   without ever seeing each other's tokens.
  *   f:<fileId>      a finished file
  *   u:<fileId>      an upload in progress, with its reserved size and when the reservation runs out
  *   bytes           space used and reserved by this room
@@ -33,13 +37,15 @@ async function passwordMatches(stored, text) {
  * File contents are in R2 under "<roomId>/<fileId>".
  *
  * A single alarm does all the timed work: dropping silent connections, giving back space from abandoned uploads,
- * and deleting the room once it has been empty for the grace period.
+ * ending the room when its timer runs out, and deleting it once it has been empty for the grace period.
  */
 export class Room extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.limits = limits(env);
-    this.edits = new WeakMap(); // Per-connection edit counts. Losing them when the room sleeps is harmless.
+    // Per-connection message counts. Losing them when the room sleeps is harmless.
+    this.edits = new WeakMap();
+    this.actions = new WeakMap();
     this.saveTimer = null;
     // Answered by Cloudflare without waking the room, so idle rooms cost nothing while people stay connected.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
@@ -66,9 +72,10 @@ export class Room extends DurableObject {
     if (this.meta) return null;
     const hashed = password ? await hashPassword(password) : null;
     if (this.meta) return null;
-    this.meta = { id, password: hashed, createdAt: Date.now() };
-    await this.ctx.storage.put('meta', this.meta);
+    this.meta = { id, password: hashed, createdAt: Date.now(), owner: null, closed: false, expiresAt: null };
     const token = await this.#addMember();
+    this.meta.owner = token;
+    await this.ctx.storage.put('meta', this.meta);
     await this.#markEmpty(); // Nobody is connected yet. If nobody ever does, the room still goes away.
     return token;
   }
@@ -76,6 +83,10 @@ export class Room extends DurableObject {
   async join(token, password, bodyError) {
     if (!this.meta) return { status: 404, error: 'Room not found. It may have ended.', counted: true };
     if (this.#sockets().length >= this.limits.maxRoomUsers) return { status: 403, error: 'This room is full.' };
+    // A locked room still lets its own people back in after a dropped signal.
+    if (this.meta.closed && !this.members.has(token)) {
+      return { status: 403, error: 'This room is locked. Ask someone inside to unlock it.' };
+    }
 
     // People already inside (a reconnect after a dropped signal) do not need the password again.
     if (this.meta.password && !this.members.has(token)) {
@@ -103,14 +114,22 @@ export class Room extends DurableObject {
 
   async #addMember() {
     const token = randomHex(24);
-    const name = `Guest-${crypto.randomInt(1000, 10000)}`;
-    this.members.set(token, name);
-    await this.ctx.storage.put(`m:${token}`, name);
+    const member = { name: `Guest-${crypto.randomInt(1000, 10000)}`, pid: randomHex(4) };
+    this.members.set(token, member);
+    await this.ctx.storage.put(`m:${token}`, member);
     return token;
   }
 
   #member(token) {
     return this.meta && token ? this.members.get(token) : undefined;
+  }
+
+  async #rename(token, name) {
+    const member = this.members.get(token);
+    if (!member || !name || member.name === name) return false;
+    member.name = name;
+    await this.ctx.storage.put(`m:${token}`, member);
+    return true;
   }
 
   /* ---------- Live connections ---------- */
@@ -123,6 +142,10 @@ export class Room extends DurableObject {
       return new Response(null, { status: 403 });
     }
 
+    // The page sends the name it wants to show (its device name, or one the person chose) with the connection.
+    await this.#rename(token, Device.cleanName(new URL(request.url).searchParams.get('name')));
+    const arriving = !this.#sockets().some((ws) => personOf(ws) === token); // A second tab is not a new arrival.
+
     const { 0: client, 1: server } = new WebSocketPair();
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({ person: token, since: Date.now() });
@@ -134,12 +157,21 @@ export class Room extends DurableObject {
     await this.#scheduleAlarm();
 
     const sockets = this.#sockets();
+    const me = this.#person(token);
     server.send(
       JSON.stringify({
         t: 'init',
-        you: this.members.get(token),
+        you: me.name,
+        me: me.pid,
+        owner: this.meta.owner === token,
+        ownerId: this.members.get(this.meta.owner)?.pid ?? null,
         users: countPeople(sockets),
+        people: this.#people(sockets),
         locked: Boolean(this.meta.password),
+        closed: this.meta.closed === true,
+        expiresAt: this.meta.expiresAt ?? null,
+        // Time left, so a page whose clock is off still counts down correctly.
+        expiresIn: this.meta.expiresAt ? this.meta.expiresAt - Date.now() : null,
         text: this.doc.text,
         v: this.doc.version,
         files: [...this.files.values()],
@@ -147,14 +179,22 @@ export class Room extends DurableObject {
         maxTextChars: this.limits.maxTextChars,
       }),
     );
-    this.#broadcast({ t: 'presence', users: countPeople(sockets) }, sockets);
+    if (arriving) this.#broadcast({ t: 'joined', ...me }, { except: token, sockets });
+    this.#broadcast(this.#presence(sockets), { sockets });
     return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws, data) {
     if (typeof data !== 'string' || !this.meta) return;
     if (data === 'ping') return ws.send('pong'); // Normally answered without waking the room.
-    this.#receiveEdit(ws, data);
+    let message;
+    try {
+      message = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (message?.op) this.#receiveEdit(ws, message.op);
+    else if (typeof message?.t === 'string') await this.#receiveAction(ws, message);
   }
 
   async webSocketClose(ws, code, reason) {
@@ -172,9 +212,24 @@ export class Room extends DurableObject {
     return this.ctx.getWebSockets().filter((ws) => ws.readyState === WebSocket.OPEN && !excluding.includes(ws));
   }
 
-  #broadcast(message, sockets = this.#sockets()) {
+  #person(token) {
+    const member = this.members.get(token);
+    return { pid: member?.pid, name: member?.name };
+  }
+
+  // Everyone connected, once each however many tabs they have open.
+  #people(sockets = this.#sockets()) {
+    return [...new Set(sockets.map(personOf))].map((token) => this.#person(token));
+  }
+
+  #presence(sockets = this.#sockets()) {
+    return { t: 'presence', users: countPeople(sockets), people: this.#people(sockets) };
+  }
+
+  #broadcast(message, { except, sockets = this.#sockets() } = {}) {
     const data = JSON.stringify(message);
     for (const ws of sockets) {
+      if (except && personOf(ws) === except) continue;
       try {
         ws.send(data);
       } catch {} // Already closing.
@@ -184,32 +239,35 @@ export class Room extends DurableObject {
   async #left(gone) {
     if (!this.meta) return;
     const remaining = this.#sockets(gone);
-    this.#broadcast({ t: 'presence', users: countPeople(remaining) }, remaining);
+    const stillHere = new Set(remaining.map(personOf));
+    for (const token of new Set(gone.map(personOf))) {
+      if (token && !stillHere.has(token)) this.#broadcast({ t: 'left', ...this.#person(token) }, { sockets: remaining });
+    }
+    this.#broadcast(this.#presence(remaining), { sockets: remaining });
     if (remaining.length === 0) {
       await this.#saveText();
       await this.#markEmpty();
     }
   }
 
+  // Counts messages per connection over a window. Returns false once the connection is over its limit.
+  #withinLimit(counts, ws, limit) {
+    const now = Date.now();
+    let window = counts.get(ws);
+    if (!window || now - window.start >= this.limits.editWindowMs) {
+      window = { start: now, count: 0 };
+      counts.set(ws, window);
+    }
+    return ++window.count <= limit;
+  }
+
   // Every change gets an answer, either the change itself to everyone or a refusal to its sender,
   // because the sender waits for one before it sends anything else.
-  #receiveEdit(ws, data) {
-    let op;
-    try {
-      op = JSON.parse(data)?.op;
-    } catch {
-      return;
-    }
+  #receiveEdit(ws, op) {
     if (typeof op?.id !== 'string' || op.id.length > 32) return;
 
     const refuse = () => ws.send(JSON.stringify({ t: 'reject', id: op.id }));
-    const now = Date.now();
-    let window = this.edits.get(ws);
-    if (!window || now - window.start >= this.limits.editWindowMs) {
-      window = { start: now, count: 0 };
-      this.edits.set(ws, window);
-    }
-    if (++window.count > this.limits.editsPerWindow) {
+    if (!this.#withinLimit(this.edits, ws, this.limits.editsPerWindow)) {
       ws.send(JSON.stringify({ t: 'notice', text: 'You are changing the text too quickly.' }));
       return refuse();
     }
@@ -219,6 +277,52 @@ export class Room extends DurableObject {
     if (!applied) return refuse();
     this.#broadcast({ t: 'text', v: this.doc.version, id: op.id, ...applied });
     this.#scheduleSave();
+  }
+
+  // Everything on the live connection that is not a text edit. Most of it is passed on to the others as it is:
+  // who is typing, upload progress, a new name. Locking and the timer belong to the person who created the room.
+  async #receiveAction(ws, message) {
+    if (!this.#withinLimit(this.actions, ws, this.limits.actionsPerWindow)) return;
+    const token = personOf(ws);
+    const me = this.#person(token);
+    const notice = (text) => ws.send(JSON.stringify({ t: 'notice', text }));
+
+    switch (message.t) {
+      case 'name': {
+        const name = Device.cleanName(message.name);
+        if (await this.#rename(token, name)) this.#broadcast({ t: 'renamed', pid: me.pid, name });
+        return;
+      }
+      case 'typing':
+        this.#broadcast({ t: 'typing', ...me }, { except: token });
+        return;
+      case 'uploading': {
+        const key = message.key;
+        if (typeof key !== 'string' || !/^[a-z0-9]{1,32}$/i.test(key)) return;
+        if (message.done) return this.#broadcast({ t: 'uploading', pid: me.pid, key, done: true }, { except: token });
+        const pct = Number(message.pct);
+        if (!Number.isFinite(pct) || pct < 0 || pct > 100) return;
+        const size = Number.isSafeInteger(message.size) && message.size >= 0 ? message.size : null;
+        this.#broadcast({ t: 'uploading', ...me, key, file: cleanFileName(message.file), size, pct: Math.round(pct) }, { except: token });
+        return;
+      }
+      case 'lock':
+        if (this.meta.owner !== token) return notice('Only the person who created the room can lock it.');
+        this.meta.closed = message.closed === true;
+        await this.ctx.storage.put('meta', this.meta);
+        this.#broadcast({ t: 'closed', closed: this.meta.closed, by: me.name, byId: me.pid });
+        return;
+      case 'timer': {
+        if (this.meta.owner !== token) return notice('Only the person who created the room can set a timer.');
+        const seconds = message.seconds;
+        if (!Number.isInteger(seconds) || seconds < 0 || seconds > this.limits.maxTimerSeconds) return;
+        this.meta.expiresAt = seconds ? Date.now() + seconds * 1000 : null;
+        await this.ctx.storage.put('meta', this.meta);
+        await this.#scheduleAlarm();
+        this.#broadcast({ t: 'timer', expiresAt: this.meta.expiresAt, expiresIn: seconds ? seconds * 1000 : null, by: me.name, byId: me.pid });
+        return;
+      }
+    }
   }
 
   // Saving on every keystroke would use up the free tier's daily writes, so the text is saved at most once a second,
@@ -241,8 +345,8 @@ export class Room extends DurableObject {
 
   /** Reserves space for an upload. The Worker then hands out a link to put the file in R2. */
   async reserveUpload(token, rawName, size) {
-    const from = this.#member(token);
-    if (!from) return { status: 403, error: 'Join this room first.' };
+    const member = this.#member(token);
+    if (!member) return { status: 403, error: 'Join this room first.' };
     if (!Number.isSafeInteger(size) || size < 0) return { status: 400, error: 'The file size is missing.' };
     if (size > this.limits.maxFileBytes) return { status: 413, error: 'This file is too large.' };
     if (this.files.size + this.uploads.size >= this.limits.maxRoomFiles) return { status: 409, error: 'This room has too many files.' };
@@ -259,7 +363,7 @@ export class Room extends DurableObject {
     }
 
     const id = randomHex(16);
-    const upload = { id, name: cleanFileName(rawName), size, from, expires: Date.now() + this.limits.uploadSlotMs };
+    const upload = { id, name: cleanFileName(rawName), size, from: member.name, fromId: member.pid, expires: Date.now() + this.limits.uploadSlotMs };
     this.uploads.set(id, upload);
     await this.ctx.storage.put({ [`u:${id}`]: upload, bytes: this.bytes });
     await this.#scheduleAlarm();
@@ -292,7 +396,7 @@ export class Room extends DurableObject {
       return { status: 400, error: 'Upload did not finish.', discard: true };
     }
 
-    const file = { id: fileId, name: upload.name, size: upload.size, from: upload.from, at: Date.now() };
+    const file = { id: fileId, name: upload.name, size: upload.size, from: upload.from, fromId: upload.fromId, at: Date.now() };
     this.files.set(fileId, file);
     await this.ctx.storage.delete(`u:${fileId}`);
     await this.ctx.storage.put(`f:${fileId}`, file);
@@ -307,8 +411,8 @@ export class Room extends DurableObject {
   }
 
   async deleteFiles(token, fileId) {
-    const by = this.#member(token);
-    if (!by) return { status: 403, error: 'Join this room first.' };
+    const member = this.#member(token);
+    if (!member) return { status: 403, error: 'Join this room first.' };
     if (fileId && !this.files.has(fileId)) return { status: 404, error: 'File not found.' };
 
     const ids = fileId ? [fileId] : [...this.files.keys()];
@@ -319,7 +423,7 @@ export class Room extends DurableObject {
     }
     this.bytes -= freed;
     // Everyone's list updates first. Storage cleanup follows and is not worth making them wait for.
-    this.#broadcast(fileId ? { t: 'fileRemoved', id: fileId } : { t: 'filesCleared', by });
+    this.#broadcast(fileId ? { t: 'fileRemoved', id: fileId } : { t: 'filesCleared', by: member.name });
 
     if (ids.length) {
       await this.ctx.storage.delete(ids.map((id) => `f:${id}`));
@@ -343,6 +447,7 @@ export class Room extends DurableObject {
     const times = [];
     if (this.#sockets().length) times.push(Date.now() + this.limits.presenceCheckMs);
     if (this.emptyAt) times.push(this.emptyAt);
+    if (this.meta.expiresAt) times.push(this.meta.expiresAt);
     for (const upload of this.uploads.values()) times.push(upload.expires);
     if (times.length) await this.ctx.storage.setAlarm(Math.min(...times));
     else await this.ctx.storage.deleteAlarm();
@@ -352,7 +457,13 @@ export class Room extends DurableObject {
     if (!this.meta) return;
     const now = Date.now();
 
-    // A phone that loses signal never sends a close, so connections that stopped pinging are dropped.
+    // The self-destruct timer ran out: everyone is told, then the room goes, even with people in it.
+    if (this.meta.expiresAt && now >= this.meta.expiresAt) {
+      this.#broadcast({ t: 'ended', reason: 'timer' });
+      return this.#destroy(4001, 'Room ended');
+    }
+
+    // A phone that loses signal or is locked stops pinging, so connections that went quiet are dropped.
     const silent = this.#sockets().filter((ws) => {
       const { since = 0 } = ws.deserializeAttachment() ?? {};
       const lastPing = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0;
@@ -381,14 +492,14 @@ export class Room extends DurableObject {
     await this.#scheduleAlarm();
   }
 
-  async #destroy() {
+  async #destroy(code = 1000, reason = 'Room ended') {
     const { id } = this.meta;
     const bytes = this.bytes;
     this.meta = null; // From here on the room answers as if it never existed.
     clearTimeout(this.saveTimer);
     for (const ws of this.ctx.getWebSockets()) {
       try {
-        ws.close(1000, 'Room ended');
+        ws.close(code, reason);
       } catch {}
     }
     this.members.clear();
@@ -407,6 +518,8 @@ export class Room extends DurableObject {
     return {
       exists: Boolean(this.meta),
       password: this.meta?.password ?? null,
+      closed: this.meta?.closed ?? false,
+      expiresAt: this.meta?.expiresAt ?? null,
       bytes: this.bytes,
       files: this.files.size,
       uploads: this.uploads.size,
@@ -416,9 +529,11 @@ export class Room extends DurableObject {
   }
 }
 
+const personOf = (ws) => ws.deserializeAttachment()?.person;
+
 // People, not connections: every tab of one browser shares a cookie, so together they count once.
 function countPeople(sockets) {
-  return new Set(sockets.map((ws) => ws.deserializeAttachment()?.person)).size;
+  return new Set(sockets.map(personOf)).size;
 }
 
 async function deletePrefix(bucket, prefix) {
