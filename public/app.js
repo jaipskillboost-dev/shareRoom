@@ -520,12 +520,12 @@ function handleMessage(data) {
     case 'joined':
       people.set(data.pid, data.name);
       if (data.pid !== me) {
-        toast(`${data.name} joined`);
+        toast(`${data.name} joined`, { long: true });
         noteUnseen();
       }
       break;
     case 'left':
-      toast(`${data.name} left`);
+      toast(`${data.name} left`, { long: true });
       typingNow.delete(data.pid);
       renderActivity();
       dropOthersUploads(data.pid);
@@ -1222,15 +1222,22 @@ $('join-form').addEventListener('submit', async (event) => {
 });
 
 $('leave-room').addEventListener('click', async () => {
-  // Leaving as the last person ends the room, so that gets a second look.
-  if (online <= 1) {
-    const leave = await confirmDialog({
-      title: 'Leave this room?',
-      body: 'You are the only one here. Leaving deletes all files and text in this room for good.',
-      action: 'Leave and delete',
-    });
-    if (!leave) return;
-  }
+  // Every device asks first, so a stray tap never drops anyone out. Leaving as the last person also ends the room.
+  const last = online <= 1;
+  const leave = await confirmDialog(
+    last
+      ? {
+          title: 'Leave this room?',
+          body: 'You are the only one here. Leaving deletes all files and text in this room for good.',
+          action: 'Leave and delete',
+        }
+      : {
+          title: 'Leave this room?',
+          body: 'The room stays open for the others. You can come back with the room code while someone is still in it.',
+          action: 'Leave',
+        },
+  );
+  if (!leave) return;
   clearTimeout(reconnectTimer);
   closeSocket();
   showHome();

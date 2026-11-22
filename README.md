@@ -53,7 +53,7 @@ npm test         # 95 tests, a few seconds
 
 - **Joining.** Creating or joining a room gives your browser a cookie scoped to that room. The file, upload and live-update endpoints all check it, and the WebSocket also checks the page's origin.
 - **Shared text.** Each change is sent as "replace these characters with this text". The server puts all changes in one order. A change made against an older version is moved past the ones that landed first, so people typing in different places, or both at the end of the text, all keep their words. If two people change the very same characters at the same instant, the one that reaches the server second is refused and that person's box shows the server's text. The logic is in `public/textsync.js`, which the browser and the server both load so they follow identical rules. `test/textsync.test.js` runs hundreds of random simulated sessions and checks that everyone ends with the same text.
-- **Who is online.** The count is people, not tabs. All tabs of one browser share a cookie and count once, so a second tab is not announced as a new arrival. A tab that closes or loses signal is noticed within about 20 seconds.
+- **Who is online.** The count is people, not tabs. All tabs of one browser share a cookie and count once, so a second tab is not announced as a new arrival. A tab that closes is noticed at once, and a phone that loses signal or is locked within about 10 seconds. The others see a notice, by name, each time someone joins or leaves, and Leave always asks first.
 - **Live activity.** Names, typing, upload progress, locking and the timer travel over the same WebSocket as the text. The server passes typing and progress straight on without storing them, limits each connection to 60 such messages per heartbeat, and only accepts locking and the timer from the room's creator. People are identified to each other by a short random ID, never by their cookie.
 - **Files.** Uploads and downloads stream straight between the network and disk, so a 2 GB file never sits in memory. Deleting a file also stops any download of it that is in progress.
 
@@ -185,7 +185,7 @@ To try it locally without an account, use Cloudflare's published test keys: site
 Anything that runs `npm start` behind HTTPS will do, as long as it is a single instance. An Oracle Cloud Always Free VM stays on all the time, but you run the server yourself.
 
 - Put it behind HTTPS (Caddy, nginx or a platform load balancer). Browsers only allow clipboard access on HTTPS, and room IDs travel in URLs.
-- In nginx, enable WebSocket upgrade headers, raise `client_max_body_size` above your file limit, set `proxy_request_buffering off` so uploads stream, and set `proxy_read_timeout` above the 10-second heartbeat.
+- In nginx, enable WebSocket upgrade headers, raise `client_max_body_size` above your file limit, set `proxy_request_buffering off` so uploads stream, and set `proxy_read_timeout` above the 5-second heartbeat.
 - Set `TRUST_PROXY` to the number of proxies in front of the server, or every visitor will share the proxy's address for rate limiting.
 - Run **one instance**. Rooms live in that process's memory and disk, so a second instance would not see them. To scale out, route by room ID at the load balancer instead of adding a shared database.
 - Give the server enough disk for `MAX_TOTAL_BYTES`.

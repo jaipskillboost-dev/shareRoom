@@ -23,7 +23,8 @@ const config = {
   trustProxyHops: envNumber('TRUST_PROXY', 0),
   // A refresh or a brief network drop should not wipe the room.
   emptyRoomGraceMs: envNumber('EMPTY_ROOM_GRACE_MS', 15_000),
-  heartbeatMs: envNumber('HEARTBEAT_MS', 10_000),
+  // How often each connection is checked. A phone that loses signal or is switched off is noticed within two of these.
+  heartbeatMs: envNumber('HEARTBEAT_MS', 5_000),
   transferIdleMs: envNumber('TRANSFER_IDLE_MS', 60_000),
   maxFileBytes: envNumber('MAX_FILE_BYTES', 2 * GiB),
   maxRoomBytes: envNumber('MAX_ROOM_BYTES', 10 * GiB),
