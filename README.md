@@ -10,8 +10,14 @@ Open the site, create a room, and open the link on your phone, tablet or another
 - **Files.** Drag and drop or pick files (up to 2 GB each by default). Everyone in the room can download them. Each file can be deleted on its own, or all at once.
 - **A shared Message box.** One text box that everyone in the room edits together, live, with no Send button. Copy all, Paste and Clear all are one tap away. People typing at the same time keep each other's words.
 - **Nothing is kept.** Text lives in server memory and files in a temporary folder. Once the last person has been gone for 15 seconds the room, its text and its files are deleted.
-- **Invite with a QR code.** Share opens a dialog with a QR code and the link. Point a phone camera at it to join, or copy the link.
+- **Invite with a QR code.** Share opens a dialog with a QR code and the link. Point a phone camera at it to join, or copy the link. The home screen also has its own **Scan a room's QR code** button, which uses the browser's built-in reader where there is one, and otherwise loads one only when needed.
 - **Optional room password.** Choose "Protect with a password" when creating a room. Anyone opening the link is asked for it, a lock icon shows inside the room, and repeated wrong guesses are blocked.
+- **See who is here.** Everyone gets a readable name from their device, such as "iPhone · Safari" or "Windows PC · Chrome", and can change it under Room options (the ⋯ button). The name is remembered on that device. A short notice shows when someone joins or leaves, by name.
+- **See what others are doing.** "iPhone · Safari is typing…" shows under the message box, and someone else's upload appears in the file list with its progress while it happens. Each file says who sent it ("from you" for your own).
+- **Notices in the background.** When the tab is hidden, its title counts new files, changes and arrivals, like "(2) Room abcd1234". A soft chime, and a buzz on phones, plays when someone else sends a file. Sound can be switched off under Room options.
+- **Download all.** One button saves every file in the room as a single zip. It is built in the browser, so the server does no extra work, and is offered up to 500 MB in total.
+- **Lock the room.** The person who created the room can lock it under Room options. Nobody new can join, even with the ID and password, while people already inside can still reconnect. Everyone sees a Locked badge.
+- **Self-destruct timer.** The creator can have the room delete itself after 10 minutes, 30 minutes or an hour, even if people are still in it. Everyone sees the countdown, and when it ends the room, its text and its files are deleted.
 - **Paste images.** Press Ctrl+V with a screenshot or photo copied (or use the Paste button) and it uploads to Files, named by date and time.
 - **View files without downloading.** Tap a file (or its eye icon) to open it full-screen: pictures, video and audio play, PDFs read page by page even on phones, and text, code, JSON and CSV files show on the spot. Step through the files with the arrows, and nothing is saved to your device.
 - **Installable.** Add it to the home screen of a phone or the desktop and it opens like an app, with its own icon.
@@ -33,7 +39,7 @@ npm start        # http://localhost:3000
 To try it from a phone on the same Wi-Fi, open `http://<your-computer's-address>:3000`. Allow Node.js through the firewall if asked. Over plain `http://` on a network address the browser may block the Paste button, so use Ctrl+V or a long press instead. It works normally over HTTPS.
 
 ```bash
-npm test         # 78 tests, a few seconds
+npm test         # 95 tests, a few seconds
 ```
 
 ## How it works
@@ -47,7 +53,8 @@ npm test         # 78 tests, a few seconds
 
 - **Joining.** Creating or joining a room gives your browser a cookie scoped to that room. The file, upload and live-update endpoints all check it, and the WebSocket also checks the page's origin.
 - **Shared text.** Each change is sent as "replace these characters with this text". The server puts all changes in one order. A change made against an older version is moved past the ones that landed first, so people typing in different places, or both at the end of the text, all keep their words. If two people change the very same characters at the same instant, the one that reaches the server second is refused and that person's box shows the server's text. The logic is in `public/textsync.js`, which the browser and the server both load so they follow identical rules. `test/textsync.test.js` runs hundreds of random simulated sessions and checks that everyone ends with the same text.
-- **Who is online.** The count is people, not tabs. All tabs of one browser share a cookie and count once. A tab that closes or loses signal is noticed within about 20 seconds.
+- **Who is online.** The count is people, not tabs. All tabs of one browser share a cookie and count once, so a second tab is not announced as a new arrival. A tab that closes or loses signal is noticed within about 20 seconds.
+- **Live activity.** Names, typing, upload progress, locking and the timer travel over the same WebSocket as the text. The server passes typing and progress straight on without storing them, limits each connection to 60 such messages per heartbeat, and only accepts locking and the timer from the room's creator. People are identified to each other by a short random ID, never by their cookie.
 - **Files.** Uploads and downloads stream straight between the network and disk, so a 2 GB file never sits in memory. Deleting a file also stops any download of it that is in progress.
 
 ## Project structure
@@ -65,7 +72,10 @@ roomShare/
 │   ├── theme.js          Light/dark switch, applied before the page paints
 │   ├── qr.js             Turns a link into QR code image data
 │   ├── filetypes.js      Decides which files can be viewed, and as what (runs in browser and server)
+│   ├── device.js         Device names and the rules for names people type (runs in browser and server)
 │   ├── vendor/qrcode.js  QR encoder by Kazuhiko Arase (MIT), copied from npm
+│   ├── vendor/fflate.js  Zip writer for Download all (MIT), loaded only when used
+│   ├── vendor/jsQR.js    QR reader for browsers without a built-in one (Apache-2.0), loaded only when used
 │   ├── vendor/pdfjs/     Mozilla's PDF reader (Apache-2.0), loaded only when a PDF is opened
 │   ├── manifest.webmanifest, icon-*.png, apple-touch-icon.png   Installable-app files
 │   └── og-image.png      Picture shown in link previews
@@ -76,6 +86,8 @@ roomShare/
     ├── view.test.js        Viewing files: types, sandboxing, range requests, access
     ├── filetypes.test.js   Which names are viewable, and that nothing runnable gets a runnable type
     ├── qr.test.js          Draws QR codes and decodes them back with a separate reader
+    ├── features.test.js    Names, join and leave notices, typing and upload activity, senders, lock, timer
+    ├── device.test.js      Device names and name cleaning
     └── textsync.test.js    Merge engine tests and random-typing simulation
 ```
 
@@ -185,7 +197,8 @@ Anything that runs `npm start` behind HTTPS will do, as long as it is a single i
 - **Files are always served as downloads,** never displayed by the browser, and the page's content security policy blocks anything but its own scripts and styles.
 - **A public anonymous file host can attract misuse.** Files are not scanned. Keep the size limits modest if you open it to everyone.
 - **Rooms are temporary on purpose.** A server restart ends every room, and the shared text is limited to 100,000 characters.
+- **Names are visible to the room.** Device names ("iPhone · Safari") and any name someone types are shown to everyone in the same room, and to nobody else. They are not stored after the room ends.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The bundled QR encoder in `public/vendor/qrcode.js` is [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) by Kazuhiko Arase, also MIT. "QR Code" is a registered trademark of Denso Wave Incorporated. The PDF reader in `public/vendor/pdfjs/` is [PDF.js](https://github.com/mozilla/pdf.js) by Mozilla, under the Apache License 2.0 (its text is in that folder).
+MIT. See [LICENSE](LICENSE). The bundled QR encoder in `public/vendor/qrcode.js` is [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) by Kazuhiko Arase, also MIT. "QR Code" is a registered trademark of Denso Wave Incorporated. The PDF reader in `public/vendor/pdfjs/` is [PDF.js](https://github.com/mozilla/pdf.js) by Mozilla, under the Apache License 2.0 (its text is in that folder). The zip writer in `public/vendor/fflate.js` is [fflate](https://github.com/101arrowz/fflate) by Arjun Barrett, under the MIT License, and the QR reader in `public/vendor/jsQR.js` is [jsQR](https://github.com/cozmo/jsQR) by Cosmo Wolfe, under the Apache License 2.0. Their licence texts are next to them in `public/vendor/`.

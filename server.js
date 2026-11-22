@@ -11,6 +11,7 @@ const { promisify } = require('node:util');
 const { WebSocket, WebSocketServer } = require('ws');
 const { Doc } = require('./public/textsync.js');
 const FileTypes = require('./public/filetypes.js');
+const Device = require('./public/device.js');
 
 const GiB = 1024 ** 3;
 const envNumber = (name, fallback) => Number(process.env[name] ?? fallback);
@@ -34,6 +35,10 @@ const config = {
   roomAttemptsPerMinute: envNumber('ROOM_ATTEMPTS_PER_MINUTE', 30),
   // Changes to the shared text one person may send per heartbeat. Only one is in flight at a time, so typing stays far below it.
   editsPerHeartbeat: 400,
+  // Other live messages (typing, upload progress, names, settings) per connection per heartbeat. Pages send far fewer.
+  actionsPerHeartbeat: 60,
+  // The longest self-destruct timer a room can have.
+  maxTimerSeconds: 24 * 60 * 60,
   // Rooms that may exist at once. A free server's memory and disk are small, and this stops a flood from filling them.
   maxRooms: envNumber('MAX_ROOMS', 500),
   // Wrong passwords allowed per room per minute from everyone together, so many addresses cannot guess one in parallel.
@@ -80,6 +85,11 @@ async function openRoom(password = null) {
     password, // { salt, key } when the creator set one. Never the password itself.
     badPasswords: { count: 0, resetAt: 0 },
     members: new Map(), // member token -> display name
+    pids: new Map(), // member token -> short public ID, so pages can tell people apart without seeing tokens
+    owner: null, // The creator's member token. Only they can lock the room or set its timer.
+    closed: false, // Locked: nobody new can join, even with the ID and password.
+    expiresAt: null, // When the self-destruct timer ends the room, if one is set.
+    expiryTimer: null,
     sockets: new Set(),
     document: new Doc(config.maxTextChars),
     files: new Map(),
@@ -104,6 +114,7 @@ function startEmptyTimer(room) {
 
 async function destroyRoom(room) {
   clearTimeout(room.emptyTimer);
+  clearTimeout(room.expiryTimer);
   room.destroyed = true;
   rooms.delete(room.id);
   totalBytes -= room.bytes;
@@ -119,11 +130,19 @@ function releaseBytes(room, size) {
   totalBytes -= size;
 }
 
-function broadcast(room, message) {
+function broadcast(room, message, { except } = {}) {
   const data = JSON.stringify(message);
   for (const ws of room.sockets) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    if (ws.readyState === WebSocket.OPEN && ws.person !== except) ws.send(data);
   }
+}
+
+// Ends a room while people are still in it (its timer ran out): tells everyone, then deletes it.
+async function endRoom(room, reason) {
+  if (room.destroyed) return;
+  broadcast(room, { t: 'ended', reason });
+  for (const ws of room.sockets) ws.close(4001, 'Room ended');
+  await destroyRoom(room);
 }
 
 /* ---------- Requests ---------- */
@@ -170,6 +189,7 @@ function admit(req, res, room, status) {
   if (!room.members.has(token)) {
     token = randomHex(24);
     room.members.set(token, `Guest-${crypto.randomInt(1000, 10000)}`);
+    room.pids.set(token, randomHex(4));
   }
   const https = config.trustProxyHops > 0 && req.headers['x-forwarded-proto']?.split(',').pop().trim() === 'https';
   res.setHeader(
@@ -177,6 +197,7 @@ function admit(req, res, room, status) {
     `member=${token}; Path=/api/rooms/${room.id}; HttpOnly; SameSite=Strict${https ? '; Secure' : ''}`,
   );
   sendJson(res, status, { id: room.id });
+  return token;
 }
 
 // Reads a small JSON body. A body that is too large is rejected after it is read, so the reply can still be sent.
@@ -246,7 +267,8 @@ async function createRoom(req, res) {
   if (typeof password !== 'string' || password.length > MAX_PASSWORD_CHARS) {
     return sendJson(res, 400, { error: `The password can be at most ${MAX_PASSWORD_CHARS} characters.` });
   }
-  admit(req, res, await openRoom(password ? await hashPassword(password) : null), 201);
+  const room = await openRoom(password ? await hashPassword(password) : null);
+  room.owner = admit(req, res, room, 201);
 }
 
 function tooManyBadPasswords(room) {
@@ -263,6 +285,10 @@ async function joinRoom(req, res, roomId) {
     return sendJson(res, 404, { error: 'Room not found. It may have ended.' });
   }
   if (room.sockets.size >= config.maxRoomUsers) return sendJson(res, 403, { error: 'This room is full.' });
+  // A locked room still lets its own people back in after a dropped signal.
+  if (room.closed && !room.members.has(memberToken(req))) {
+    return sendJson(res, 403, { error: 'This room is locked. Ask someone inside to unlock it.', locked: true });
+  }
 
   // People already inside (a reconnect after a dropped signal) do not need the password again.
   if (room.password && !room.members.has(memberToken(req))) {
@@ -311,6 +337,7 @@ async function uploadFile(req, res, room, rawName) {
   const filePath = path.join(roomDir(room.id), id); // Never the client's name, so no path tricks.
   const output = fs.createWriteStream(filePath, { flags: 'wx' });
   const from = room.members.get(memberToken(req));
+  const fromId = room.pids.get(memberToken(req));
   room.transfers.add(output);
   req.setTimeout(config.transferIdleMs, () => req.destroy());
 
@@ -327,7 +354,7 @@ async function uploadFile(req, res, room, rawName) {
 
   if (room.destroyed) return sendJson(res, 410, { error: 'This room has ended.' });
 
-  const file = { id, name: cleanFileName(rawName), size, from, at: Date.now() };
+  const file = { id, name: cleanFileName(rawName), size, from, fromId, at: Date.now() };
   room.files.set(id, file);
   broadcast(room, { t: 'file', file });
   sendJson(res, 201, file);
@@ -474,6 +501,7 @@ function loadAssets() {
     '/theme.js': text('theme.js'),
     '/qr.js': text('qr.js'),
     '/filetypes.js': text('filetypes.js'),
+    '/device.js': text('device.js'),
   };
   const qrLibrary = text('vendor/qrcode.js');
   const styles = text('style.css');
@@ -497,6 +525,10 @@ function loadAssets() {
   const week = 'public, max-age=604800';
   for (const file of ['pdf.min.mjs', 'pdf.worker.min.mjs']) {
     found[`/vendor/pdfjs/${file}`] = buildAsset(js, text(`vendor/pdfjs/${file}`), week, { brotliQuality: 5 });
+  }
+  // Loaded only when someone downloads all files as a zip, or scans a QR code without the browser's own scanner.
+  for (const file of ['fflate.js', 'jsQR.js']) {
+    found[`/vendor/${file}`] = buildAsset(js, text(`vendor/${file}`), week, { brotliQuality: 5 });
   }
   for (const image of ['icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png', 'og-image.png']) {
     found[`/${image}`] = buildAsset('image/png', bytes(image), daily, { compress: false });
@@ -611,30 +643,48 @@ server.on('upgrade', (req, socket, head) => {
 
   const room = memberRoom(req, match[1]);
   if (!room || room.sockets.size >= config.maxRoomUsers) return refuse('403 Forbidden');
-  wss.handleUpgrade(req, socket, head, (ws) => addSocket(ws, room, memberToken(req)));
+  // The page sends the name it wants to show (its device name, or one the person chose) with the connection.
+  const name = Device.cleanName(new URL(req.url, 'http://localhost').searchParams.get('name'));
+  wss.handleUpgrade(req, socket, head, (ws) => addSocket(ws, room, memberToken(req), name));
 });
 
 // People, not connections: every tab of one browser shares a cookie, so together they count once.
 const countPeople = (room) => new Set([...room.sockets].map((ws) => ws.person)).size;
+const isConnected = (room, token) => [...room.sockets].some((ws) => ws.person === token);
+const person = (room, token) => ({ pid: room.pids.get(token), name: room.members.get(token) });
+const people = (room) => [...new Set([...room.sockets].map((ws) => ws.person))].map((token) => person(room, token));
+const presence = (room) => ({ t: 'presence', users: countPeople(room), people: people(room) });
 
-function addSocket(ws, room, token) {
+function addSocket(ws, room, token, name) {
   clearTimeout(room.emptyTimer);
+  const arriving = !isConnected(room, token); // A second tab of someone already here is not a new arrival.
+  if (name) room.members.set(token, name);
   room.sockets.add(ws);
   ws.person = token;
   ws.isAlive = true;
   ws.editCount = 0;
+  ws.actionCount = 0;
 
   ws.on('pong', () => {
     ws.isAlive = true;
   });
   ws.on('error', () => ws.terminate());
   ws.on('message', (data, isBinary) => {
-    if (!isBinary) receiveEdit(ws, room, data);
+    if (isBinary) return;
+    let message;
+    try {
+      message = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (message?.op) receiveEdit(ws, room, message.op);
+    else if (typeof message?.t === 'string') receiveAction(ws, room, message);
   });
   ws.on('close', () => {
     room.sockets.delete(ws);
     if (room.destroyed) return;
-    broadcast(room, { t: 'presence', users: countPeople(room) });
+    if (!isConnected(room, token)) broadcast(room, { t: 'left', ...person(room, token) });
+    broadcast(room, presence(room));
     if (room.sockets.size === 0) startEmptyTimer(room);
   });
 
@@ -642,8 +692,16 @@ function addSocket(ws, room, token) {
     JSON.stringify({
       t: 'init',
       you: room.members.get(token),
+      me: room.pids.get(token),
+      owner: room.owner === token,
+      ownerId: room.pids.get(room.owner),
       users: countPeople(room),
+      people: people(room),
       locked: Boolean(room.password),
+      closed: room.closed,
+      expiresAt: room.expiresAt,
+      // Time left, so a page whose clock is off still counts down correctly.
+      expiresIn: room.expiresAt ? room.expiresAt - Date.now() : null,
       text: room.document.text,
       v: room.document.version,
       files: [...room.files.values()],
@@ -651,7 +709,58 @@ function addSocket(ws, room, token) {
       maxTextChars: config.maxTextChars,
     }),
   );
-  broadcast(room, { t: 'presence', users: countPeople(room) });
+  if (arriving) broadcast(room, { t: 'joined', ...person(room, token) }, { except: token });
+  broadcast(room, presence(room));
+}
+
+// Everything on the live connection that is not a text edit. Most of it is passed on to the others as it is:
+// who is typing, upload progress, a new name. Locking and the timer belong to the person who created the room.
+function receiveAction(ws, room, message) {
+  if (++ws.actionCount > config.actionsPerHeartbeat) return;
+  const token = ws.person;
+  const me = person(room, token);
+  const notice = (text) => ws.send(JSON.stringify({ t: 'notice', text }));
+
+  switch (message.t) {
+    case 'name': {
+      const name = Device.cleanName(message.name);
+      if (!name || name === me.name) return;
+      room.members.set(token, name);
+      broadcast(room, { t: 'renamed', pid: me.pid, name });
+      return;
+    }
+    case 'typing':
+      broadcast(room, { t: 'typing', ...me }, { except: token });
+      return;
+    case 'uploading': {
+      const key = message.key;
+      if (typeof key !== 'string' || !/^[a-z0-9]{1,32}$/i.test(key)) return;
+      if (message.done) return broadcast(room, { t: 'uploading', pid: me.pid, key, done: true }, { except: token });
+      const pct = Number(message.pct);
+      if (!Number.isFinite(pct) || pct < 0 || pct > 100) return;
+      const size = Number.isSafeInteger(message.size) && message.size >= 0 ? message.size : null;
+      broadcast(room, { t: 'uploading', ...me, key, file: cleanFileName(message.file), size, pct: Math.round(pct) }, { except: token });
+      return;
+    }
+    case 'lock':
+      if (room.owner !== token) return notice('Only the person who created the room can lock it.');
+      room.closed = message.closed === true;
+      broadcast(room, { t: 'closed', closed: room.closed, by: me.name, byId: me.pid });
+      return;
+    case 'timer': {
+      if (room.owner !== token) return notice('Only the person who created the room can set a timer.');
+      const seconds = message.seconds;
+      if (!Number.isInteger(seconds) || seconds < 0 || seconds > config.maxTimerSeconds) return;
+      clearTimeout(room.expiryTimer);
+      room.expiresAt = seconds ? Date.now() + seconds * 1000 : null;
+      if (seconds) {
+        room.expiryTimer = setTimeout(() => endRoom(room, 'timer').catch(console.error), seconds * 1000);
+        room.expiryTimer.unref();
+      }
+      broadcast(room, { t: 'timer', expiresAt: room.expiresAt, expiresIn: seconds ? seconds * 1000 : null, by: me.name, byId: me.pid });
+      return;
+    }
+  }
 }
 
 function isEdit(op) {
@@ -669,13 +778,7 @@ function isEdit(op) {
 
 // Every change gets an answer, either the change itself to everyone or a refusal to its sender,
 // because the sender waits for one before it sends anything else.
-function receiveEdit(ws, room, data) {
-  let op;
-  try {
-    op = JSON.parse(data)?.op;
-  } catch {
-    return;
-  }
+function receiveEdit(ws, room, op) {
   if (typeof op?.id !== 'string' || op.id.length > 32) return;
 
   const refuse = () => ws.send(JSON.stringify({ t: 'reject', id: op.id }));
@@ -700,6 +803,7 @@ setInterval(() => {
       }
       ws.isAlive = false;
       ws.editCount = 0;
+      ws.actionCount = 0;
       ws.ping();
     }
   }
