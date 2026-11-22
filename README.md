@@ -41,7 +41,7 @@ npm run dev      # http://localhost:8787
 To try it from a phone on the same Wi-Fi, run `npx wrangler dev --ip 0.0.0.0` and open `http://<your-computer's-address>:8787`. Over plain `http://` on a network address the browser may block the Paste button, so use Ctrl+V or a long press instead. It works normally over HTTPS.
 
 ```bash
-npm test         # NN tests, about a minute
+npm test         # 106 tests, about 45 seconds
 ```
 
 The tests start the Worker locally with Wrangler's test harness (`test/harness.js`), so they cover the real routes, Durable Objects and R2 bucket.
@@ -198,7 +198,7 @@ What the free plan gives, and how RoomShare stays inside it:
 | Limit | How RoomShare fits |
 | --- | --- |
 | Workers: 100,000 requests a day, 10 ms of CPU each | Pages and scripts are Static Assets and do not count. File bytes go straight to R2, and downloads only stream |
-| Durable Objects: 100,000 requests and 13,000 GB-s a day | Rooms sleep between messages, and pings are answered without waking them |
+| Durable Objects: 100,000 requests and 13,000 GB-s a day | Rooms sleep between messages, and pings are answered without waking them. While people are in a room, it checks every 6 seconds for phones that dropped off, about 600 requests an hour per open room |
 | Durable Object storage: 100,000 rows written a day | The shared text is saved at most once a second, not on every keystroke |
 | R2: 10 GB stored | `MAX_TOTAL_BYTES` stops new uploads at 8 GiB, and rooms delete their files when they close |
 
