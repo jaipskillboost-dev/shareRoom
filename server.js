@@ -591,6 +591,13 @@ async function route(req, res) {
   const url = new URL(req.url, 'http://localhost');
   const { pathname } = url;
 
+  // For uptime monitors and keep-alive pings (Render's free plan sleeps after 15 minutes without traffic).
+  // It touches no rooms and is not rate limited, so pinging it often is harmless.
+  if (pathname === '/healthz' && (req.method === 'GET' || req.method === 'HEAD')) {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ ok: true }));
+  }
+
   if (pathname === '/api/rooms' && req.method === 'POST') return createRoom(req, res);
 
   const match = pathname.match(ROOM_ROUTE);

@@ -158,6 +158,7 @@ Everything is optional. Set these as environment variables.
 What to expect on the free plan:
 
 - The service sleeps after 15 minutes with no inbound traffic, so the first visit after a quiet period waits for it to wake. Open WebSocket messages count as traffic.
+- To keep it awake, have a free cron service (for example cron-job.org) request `https://<name>.onrender.com/healthz` every 5 to 10 minutes. It answers `{"ok":true}` without touching any room. One always-on free service uses about 720 to 744 of the 750 free instance hours Render gives each month, so do this for one service only.
 - The disk is temporary and Render can restart the service at any time. Either one ends every open room, which matches the "nothing is kept" design.
 - The limits in `render.yaml` (100 MB per file, 500 MB per room, 1 GB in total) suit a small free disk. Raise them on a larger plan.
 - Everyone in a room connects to this one server, so people far from its region see each other's changes a round trip later, roughly 100 to 300 ms between continents. Pick the region closest to most of your users.

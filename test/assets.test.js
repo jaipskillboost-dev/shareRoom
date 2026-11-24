@@ -100,3 +100,12 @@ test('room links ask search engines to stay out, and the home page does not', as
   assert.equal((await fetch(`${base}/r/abcdefgh`)).headers.get('x-robots-tag'), 'noindex, nofollow');
   assert.equal((await fetch(`${base}/`)).headers.get('x-robots-tag'), null);
 });
+
+test('the health endpoint answers quickly for keep-alive pings, and is never cached', async () => {
+  const response = await fetch(`${base}/healthz`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true });
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal((await fetch(`${base}/healthz`, { method: 'HEAD' })).status, 200);
+  assert.equal((await fetch(`${base}/healthz`, { method: 'POST' })).status, 404);
+});
